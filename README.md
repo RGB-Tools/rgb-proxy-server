@@ -32,6 +32,9 @@ Anyone can deploy an RGB proxy server instance, so while the server operator
 can still perform censorship attacks towards users, concerns can be avoided by
 simply using a different server provider or by self-hosting an instance.
 
+This project was originally implemented in
+[grunch/rgb-proxy-server](https://github.com/grunch/rgb-proxy-server).
+
 ## Running the app
 
 ```
