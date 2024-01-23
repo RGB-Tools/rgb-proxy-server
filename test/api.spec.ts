@@ -11,7 +11,7 @@ const contentTypeForm = "multipart/form-data";
 
 // temporary test directory
 const tempDir = fs.mkdtempSync(path.join(__dirname, "temp-"));
-process.env.APP_DIR = path.join(tempDir, "app-dir");
+process.env.APP_DATA = path.join(tempDir, "app-data");
 
 loadApiEndpoints(app);
 

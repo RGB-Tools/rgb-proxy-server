@@ -1,1 +1,1 @@
-export const DEFAULT_APP_DIR_NAME = ".rgb-proxy-server";
+export const DEFAULT_APP_DATA = ".rgb-proxy-server";

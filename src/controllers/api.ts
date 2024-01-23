@@ -30,7 +30,7 @@ import {
 } from "../errors";
 import { logger } from "../logger";
 import { genHashFromFile, setDir } from "../util";
-import { DEFAULT_APP_DIR_NAME } from "../vars";
+import { DEFAULT_APP_DATA } from "../vars";
 import { APP_VERSION } from "../version";
 
 const PROTOCOL_VERSION = "0.2";
@@ -370,7 +370,7 @@ jsonRpcServer.addMethod(
 
 export const loadApiEndpoints = (app: Application): void => {
   // setup app directories
-  appDir = process.env.APP_DIR || path.join(homedir(), DEFAULT_APP_DIR_NAME);
+  appDir = process.env.APP_DATA || path.join(homedir(), DEFAULT_APP_DATA);
   setDir(appDir);
   ds = Datastore.create(path.join(appDir, DATABASE_FILE));
   tempDir = path.join(appDir, "tmp");
