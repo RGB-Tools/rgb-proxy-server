@@ -37,7 +37,8 @@ This project was originally implemented in
 
 ## Running the app
 
-```
+### Locally
+```sh
 # install dependencies
 npm install
 
@@ -51,6 +52,19 @@ npm run build
 npm run start
 ```
 
+### In docker
+```sh
+docker run -d ghcr.io/rgb-tools/rgb-proxy-server
+```
+
+For data persistence, mount a host path to `/home/node/.rgb-proxy-server`
+inside the container. The directory needs to be owned by user and group `1000`.
+
+### Data
+Data is stored in `$HOME/.rgb-proxy-server` by default.
+
+The default data path can be overridden via the `APP_DATA` environment variable.
+
 ## Example usage
 
 The payee generates an RGB invoice and sends it to the payer (not covered
@@ -59,58 +73,65 @@ here). Let's assume the invoice contains the blinded UTXO `blindTest`.
 The payer prepares the transfer, then sends the consignment file and the
 related txid to the proxy server, using the blinded UTXO from the invoice as
 identifier:
-```
+```sh
 # let's create a fake consignment file and send it
-$ echo "consignment binary data" > consignment.rgb
-$ curl -X POST -H 'Content-Type: multipart/form-data' \
+echo "consignment binary data" > consignment.rgb
+curl -X POST -H 'Content-Type: multipart/form-data' \
   -F 'jsonrpc=2.0' -F 'id="1"' -F 'method=consignment.post' \
   -F 'params[recipient_id]=blindTest' -F 'params[txid]=527f2b2ebb81c873f128848d7226ecdb7cb4a4025222c54bfec7c358d51b9207' -F 'file=@consignment.rgb' \
   localhost:3000/json-rpc
 
-{"jsonrpc":"2.0","id":"1","result":true}
+# example output
+# {"jsonrpc":"2.0","id":"1","result":true}
 ```
 
 The payee requests the consignment for the blinded UTXO:
-```
-$ curl -X POST -H 'Content-Type: application/json' \
+```sh
+curl -X POST -H 'Content-Type: application/json' \
   -d '{"jsonrpc": "2.0", "id": "2", "method": "consignment.get", "params": {"recipient_id": "blindTest"} }' \
   localhost:3000/json-rpc
 
-{"jsonrpc":"2.0","id":"2","result": {"consignment": "Y29uc2lnbm1lbnQgYmluYXJ5IGRhdGEK", "txid": "527f2b2ebb81c873f128848d7226ecdb7cb4a4025222c54bfec7c358d51b9207"}}
+# example output
+# {"jsonrpc":"2.0","id":"2","result": {"consignment": "Y29uc2lnbm1lbnQgYmluYXJ5IGRhdGEK", "txid": "527f2b2ebb81c873f128848d7226ecdb7cb4a4025222c54bfec7c358d51b9207"}}
 
 ```
 The file is returned as a base64-encoded string:
-```
-$ echo 'Y29uc2lnbm1lbnQgYmluYXJ5IGRhdGEK' | base64 -d
-consignment binary data
+```sh
+echo 'Y29uc2lnbm1lbnQgYmluYXJ5IGRhdGEK' | base64 -d
+
+# example output
+# consignment binary data
 ```
 
 If the consignment is valid, the payee ACKs it:
-```
-$ curl -X POST -H 'Content-Type: application/json' \
+```sh
+curl -X POST -H 'Content-Type: application/json' \
   -d '{"jsonrpc": "2.0", "id": "3", "method": "ack.post", "params": {"recipient_id": "blindTest", "ack": true} }' \
   localhost:3000/json-rpc
 
-{"jsonrpc":"2.0","id":"3","result":true}
+# example output
+# {"jsonrpc":"2.0","id":"3","result":true}
 ```
 
 If the consignment is invalid, the payee NACKs it:
-```
-$ curl -X POST -H 'Content-Type: application/json' \
+```sh
+curl -X POST -H 'Content-Type: application/json' \
   -d '{"jsonrpc": "2.0", "id": "4", "method": "ack.post", "params": {"recipient_id": "blindTest", "ack": false} }' \
   localhost:3000/json-rpc
 
-{"jsonrpc":"2.0","id":"4","result":true}
+# example output
+# {"jsonrpc":"2.0","id":"4","result":true}
 ```
 
 The payer requests the `ack` value (`null` if payee has not called `ack.post`
 yet):
-```
-$ curl -X POST -H 'Content-Type: application/json' \
+```sh
+curl -X POST -H 'Content-Type: application/json' \
   -d '{"jsonrpc": "2.0", "id": "5", "method": "ack.get", "params": {"recipient_id": "blindTest"} }' \
   localhost:3000/json-rpc
 
-{"jsonrpc":"2.0","id":"5","result":true}
+# example output
+# {"jsonrpc":"2.0","id":"5","result":true}
 ```
 
 In case of approval the transaction can be broadcast, otherwise the two parties
@@ -122,15 +143,17 @@ approval cannot be changed once submitted.
 
 ## Testing
 
-### Jest with supertest
+```sh
+# install dependencies
+npm run install
 
-```
+# run test suite
 npm run test
 ```
 
 ## Linting
 
-```
+```sh
 # run linter
 npm run lint
 
