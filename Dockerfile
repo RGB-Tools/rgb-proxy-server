@@ -1,13 +1,18 @@
-FROM node:18-bullseye
+FROM node:20-bookworm-slim
 
 RUN apt-get -y update \
     && apt-get -y install tini \
     && apt-get clean && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
-WORKDIR "/srv"
+ENV APP_DIR="/srv/app"
 
-COPY package.json package-lock.json tsconfig.json ./
-COPY src ./src
+WORKDIR ${APP_DIR}
+RUN chown node:node ${APP_DIR}
+
+USER "node"
+
+COPY --chown=node:node package.json package-lock.json tsconfig.json ./
+COPY --chown=node:node src ./src
 
 RUN npm install
 RUN npm run build
@@ -15,6 +20,5 @@ RUN npm run build
 ENV NODE_ENV="production"
 
 EXPOSE 3000/tcp
-VOLUME ["/root/.npm", "/root/.rgb-proxy-server"]
 
-CMD ["tini", "--", "npm", "run", "start"]
+CMD ["tini", "--", "node", "./dist/server.js"]
