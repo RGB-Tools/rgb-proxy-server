@@ -1,3 +1,4 @@
+import DatabaseConstructor, { type Database } from "better-sqlite3";
 import { Application, Request, Response } from "express";
 import httpContext from "express-http-context";
 import fs from "fs";
@@ -8,7 +9,6 @@ import {
   JSONRPCServer,
 } from "json-rpc-2.0";
 import multer from "multer";
-import Datastore from "nedb-promises";
 import { homedir } from "os";
 import path from "path";
 
@@ -46,7 +46,7 @@ const storage = multer.diskStorage({
 const upload = multer({ storage });
 
 let appDir: string;
-let ds: Datastore<{ _id: string }>;
+let db: Database;
 let tempDir: string;
 let consignmentDir: string;
 let mediaDir: string;
@@ -64,19 +64,24 @@ interface ConsignmentGetRes {
 }
 
 interface Consignment {
-  _id?: string;
+  recipientID: string;
   filename: string;
-  recipient_id: string;
   txid: string;
   vout?: number;
   ack?: boolean;
-  nack?: boolean; // to be removed when removing old APIs
-  responded?: boolean; // to be removed when removing old APIs
+}
+
+interface ConsignmentDB {
+  recipient_id: string;
+  filename: string;
+  txid: string;
+  vout: number | null;
+  ack: number | null;
 }
 
 interface Media {
-  filename: string;
   attachment_id: string;
+  filename: string;
 }
 
 function isBoolean(data: unknown): data is boolean {
@@ -188,17 +193,39 @@ function getVoutParam(jsonRpcParams: Partial<JSONRPCParams> | undefined) {
   return undefined;
 }
 
-async function getConsignment(
+function getConsignment(recipientID: string): Consignment | null {
+  const result = db
+    .prepare("SELECT * FROM consignments WHERE recipient_id = ?")
+    .get(recipientID) as ConsignmentDB | undefined;
+  if (result) {
+    return {
+      recipientID: result.recipient_id,
+      filename: result.filename,
+      txid: result.txid,
+      vout: result.vout ?? undefined,
+      ack: result.ack !== null ? Boolean(result.ack) : undefined,
+    };
+  } else {
+    return null;
+  }
+}
+
+function getConsignmentOrFail(
   jsonRpcParams: Partial<JSONRPCParams> | undefined
-) {
+): Consignment {
   const recipientID = getRecipientIDParam(jsonRpcParams);
-  const consignment: Consignment | null = await ds.findOne({
-    recipient_id: recipientID,
-  });
+  const consignment = getConsignment(recipientID);
   if (!consignment) {
     throw new NotFoundConsignment(jsonRpcParams);
   }
   return consignment;
+}
+
+function getMedia(attachmentID: string): Media | null {
+  const result = db
+    .prepare("SELECT * FROM media WHERE attachment_id = ?")
+    .get(attachmentID) as Media | undefined;
+  return result ?? null;
 }
 
 interface ServerParams {
@@ -226,7 +253,7 @@ jsonRpcServer.addMethod(
 jsonRpcServer.addMethod(
   "consignment.get",
   async (jsonRpcParams, _serverParams): Promise<ConsignmentGetRes> => {
-    const consignment = await getConsignment(jsonRpcParams);
+    const consignment = getConsignmentOrFail(jsonRpcParams);
     const fileBuffer = fs.readFileSync(
       path.join(consignmentDir, consignment.filename)
     );
@@ -242,18 +269,16 @@ jsonRpcServer.addMethod(
   "consignment.post",
   async (jsonRpcParams, serverParams): Promise<boolean> => {
     const file = serverParams?.file;
+    if (!file) {
+      throw new MissingFile(jsonRpcParams);
+    }
     try {
       const recipientID = getRecipientIDParam(jsonRpcParams);
       const txid = getTxidParam(jsonRpcParams);
       const vout = getVoutParam(jsonRpcParams);
-      if (!file) {
-        throw new MissingFile(jsonRpcParams);
-      }
       const uploadedFile = path.join(tempDir, file.filename);
       const fileHash = genHashFromFile(uploadedFile);
-      const prevFile: Consignment | null = await ds.findOne({
-        recipient_id: recipientID,
-      });
+      const prevFile = getConsignment(recipientID);
       if (prevFile) {
         if (prevFile.filename === fileHash) {
           fs.unlinkSync(path.join(tempDir, file.filename));
@@ -263,13 +288,11 @@ jsonRpcServer.addMethod(
         }
       }
       fs.renameSync(uploadedFile, path.join(consignmentDir, fileHash));
-      const consignment: Consignment = {
-        filename: fileHash,
-        recipient_id: recipientID,
-        txid: txid,
-        vout: vout,
-      };
-      await ds.insert(consignment);
+      const insert = db.prepare(
+        `INSERT INTO consignments (recipient_id, filename, txid, vout, ack)
+         VALUES (?, ?, ?, ?, ?)`
+      );
+      insert.run(recipientID, fileHash, txid, vout, null);
       return true;
     } catch (e: unknown) {
       if (file) {
@@ -287,9 +310,7 @@ jsonRpcServer.addMethod(
   "media.get",
   async (jsonRpcParams, _serverParams): Promise<string> => {
     const attachmentID = getAttachmentIDParam(jsonRpcParams);
-    const media: Media | null = await ds.findOne({
-      attachment_id: attachmentID,
-    });
+    const media = getMedia(attachmentID);
     if (!media) {
       throw new NotFoundMedia(jsonRpcParams);
     }
@@ -309,9 +330,7 @@ jsonRpcServer.addMethod(
       }
       const uploadedFile = path.join(tempDir, file.filename);
       const fileHash = genHashFromFile(uploadedFile);
-      const prevFile: Media | null = await ds.findOne({
-        attachment_id: attachmentID,
-      });
+      const prevFile = getMedia(attachmentID);
       if (prevFile) {
         if (prevFile.filename === fileHash) {
           fs.unlinkSync(path.join(tempDir, file.filename));
@@ -321,11 +340,10 @@ jsonRpcServer.addMethod(
         }
       }
       fs.renameSync(uploadedFile, path.join(mediaDir, fileHash));
-      const media: Media = {
-        filename: fileHash,
-        attachment_id: attachmentID,
-      };
-      await ds.insert(media);
+      const insert = db.prepare(
+        "INSERT INTO media (attachment_id, filename) VALUES (?, ?)"
+      );
+      insert.run(attachmentID, fileHash);
       return true;
     } catch (e: unknown) {
       if (file) {
@@ -342,7 +360,7 @@ jsonRpcServer.addMethod(
 jsonRpcServer.addMethod(
   "ack.get",
   async (jsonRpcParams, _serverParams): Promise<boolean | undefined> => {
-    const consignment = await getConsignment(jsonRpcParams);
+    const consignment = getConsignmentOrFail(jsonRpcParams);
     return consignment.ack;
   }
 );
@@ -350,7 +368,7 @@ jsonRpcServer.addMethod(
 jsonRpcServer.addMethod(
   "ack.post",
   async (jsonRpcParams, _serverParams): Promise<boolean> => {
-    const consignment = await getConsignment(jsonRpcParams);
+    const consignment = getConsignmentOrFail(jsonRpcParams);
     const ack = getAckParam(jsonRpcParams);
     if (consignment.ack != null) {
       if (consignment.ack === ack) {
@@ -359,11 +377,10 @@ jsonRpcServer.addMethod(
         throw new CannotChangeAck(jsonRpcParams);
       }
     }
-    await ds.update(
-      { recipient_id: consignment.recipient_id },
-      { $set: { ack: ack } },
-      { multi: false }
+    const update = db.prepare(
+      "UPDATE consignments SET ack = ? WHERE recipient_id = ?"
     );
+    update.run(ack ? 1 : 0, consignment.recipientID);
     return true;
   }
 );
@@ -372,13 +389,35 @@ export const loadApiEndpoints = (app: Application): void => {
   // setup app directories
   appDir = process.env.APP_DATA || path.join(homedir(), DEFAULT_APP_DATA);
   setDir(appDir);
-  ds = Datastore.create(path.join(appDir, DATABASE_FILE));
   tempDir = path.join(appDir, "tmp");
   consignmentDir = path.join(appDir, "consignments");
   mediaDir = path.join(appDir, "media");
   setDir(tempDir);
   setDir(consignmentDir);
   setDir(mediaDir);
+
+  // setup DB
+  db = new DatabaseConstructor(path.join(appDir, DATABASE_FILE), {});
+  db.pragma("journal_mode = WAL");
+  const createConsignmentsTable = db.prepare(
+    `CREATE TABLE IF NOT EXISTS consignments (
+       id INTEGER PRIMARY KEY AUTOINCREMENT,
+       recipient_id TEXT NOT NULL UNIQUE,
+       filename TEXT NOT NULL,
+       txid TEXT NOT NULL,
+       vout INTEGER,
+       ack INTEGER
+     )`
+  );
+  createConsignmentsTable.run();
+  const createMediaTable = db.prepare(
+    `CREATE TABLE IF NOT EXISTS media (
+       id INTEGER PRIMARY KEY AUTOINCREMENT,
+       attachment_id TEXT NOT NULL UNIQUE,
+       filename TEXT NOT NULL
+     )`
+  );
+  createMediaTable.run();
 
   // setup app route
   app.post(
