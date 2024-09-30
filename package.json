@@ -9,6 +9,7 @@
     "dev": "ts-node-dev ./src/server.ts",
     "prebuild": "npm run version",
     "build": "tsc",
+    "format": "prettier --write .",
     "lint": "eslint --ignore-path .gitignore . --ext .ts",
     "lint:fix": "npm run lint -- --fix",
     "pretest": "npm run version",

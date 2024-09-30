@@ -38,6 +38,7 @@ This project was originally implemented in
 ## Running the app
 
 ### Locally
+
 ```sh
 # install dependencies
 npm install
@@ -53,6 +54,7 @@ npm run start
 ```
 
 ### In docker
+
 ```sh
 docker run -d ghcr.io/rgb-tools/rgb-proxy-server
 ```
@@ -61,6 +63,7 @@ For data persistence, mount a host path to `/home/node/.rgb-proxy-server`
 inside the container. The directory needs to be owned by user and group `1000`.
 
 ### Data
+
 Data is stored in `$HOME/.rgb-proxy-server` by default.
 
 The default data path can be overridden via the `APP_DATA` environment variable.
@@ -73,6 +76,7 @@ here). Let's assume the invoice contains the blinded UTXO `blindTest`.
 The payer prepares the transfer, then sends the consignment file and the
 related txid to the proxy server, using the blinded UTXO from the invoice as
 identifier:
+
 ```sh
 # let's create a fake consignment file and send it
 echo "consignment binary data" > consignment.rgb
@@ -86,6 +90,7 @@ curl -X POST -H 'Content-Type: multipart/form-data' \
 ```
 
 The payee requests the consignment for the blinded UTXO:
+
 ```sh
 curl -X POST -H 'Content-Type: application/json' \
   -d '{"jsonrpc": "2.0", "id": "2", "method": "consignment.get", "params": {"recipient_id": "blindTest"} }' \
@@ -95,7 +100,9 @@ curl -X POST -H 'Content-Type: application/json' \
 # {"jsonrpc":"2.0","id":"2","result": {"consignment": "Y29uc2lnbm1lbnQgYmluYXJ5IGRhdGEK", "txid": "527f2b2ebb81c873f128848d7226ecdb7cb4a4025222c54bfec7c358d51b9207"}}
 
 ```
+
 The file is returned as a base64-encoded string:
+
 ```sh
 echo 'Y29uc2lnbm1lbnQgYmluYXJ5IGRhdGEK' | base64 -d
 
@@ -104,6 +111,7 @@ echo 'Y29uc2lnbm1lbnQgYmluYXJ5IGRhdGEK' | base64 -d
 ```
 
 If the consignment is valid, the payee ACKs it:
+
 ```sh
 curl -X POST -H 'Content-Type: application/json' \
   -d '{"jsonrpc": "2.0", "id": "3", "method": "ack.post", "params": {"recipient_id": "blindTest", "ack": true} }' \
@@ -114,6 +122,7 @@ curl -X POST -H 'Content-Type: application/json' \
 ```
 
 If the consignment is invalid, the payee NACKs it:
+
 ```sh
 curl -X POST -H 'Content-Type: application/json' \
   -d '{"jsonrpc": "2.0", "id": "4", "method": "ack.post", "params": {"recipient_id": "blindTest", "ack": false} }' \
@@ -125,6 +134,7 @@ curl -X POST -H 'Content-Type: application/json' \
 
 The payer requests the `ack` value (`null` if payee has not called `ack.post`
 yet):
+
 ```sh
 curl -X POST -H 'Content-Type: application/json' \
   -d '{"jsonrpc": "2.0", "id": "5", "method": "ack.get", "params": {"recipient_id": "blindTest"} }' \
@@ -140,7 +150,6 @@ need to abort the transfer process and start from scratch.
 The consignment or media file for any given recipient ID and the related
 approval cannot be changed once submitted.
 
-
 ## Testing
 
 ```sh
@@ -149,6 +158,13 @@ npm run install
 
 # run test suite
 npm run test
+```
+
+## Formatting
+
+```sh
+# format the code
+npm run format
 ```
 
 ## Linting
