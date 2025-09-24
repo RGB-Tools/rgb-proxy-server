@@ -57,10 +57,15 @@ interface ServerInfo {
   uptime: number;
 }
 
+interface RgbInvoiceValue {
+    value?: string;
+}
+
 interface ConsignmentGetRes {
   consignment: string;
   txid: string;
   vout?: number;
+  sender_amount?: RgbInvoiceValue;
 }
 
 interface Consignment {
@@ -69,6 +74,7 @@ interface Consignment {
   txid: string;
   vout?: number;
   ack?: boolean;
+  sender_amount?: string | null;
 }
 
 interface ConsignmentDB {
@@ -77,6 +83,7 @@ interface ConsignmentDB {
   txid: string;
   vout: number | null;
   ack: number | null;
+  sender_amount: string | null;
 }
 
 interface Media {
@@ -110,23 +117,6 @@ function truncateText(content: string, limit = 16) {
   if (!content) return "";
   if (content.length <= limit) return content;
   return content.slice(0, limit) + "...";
-}
-
-function joinEntries(entries: object) {
-  let joined = "<";
-  let keysCount = Object.keys(entries).length;
-  Object.entries(entries).forEach(([k, v]) => {
-    let value = v;
-    if (isString(v)) {
-      value = truncateText(v as string);
-    }
-    joined += `${k}: ${value}`;
-    keysCount--;
-    if (keysCount > 0) {
-      joined += ", ";
-    }
-  });
-  return joined + ">";
 }
 
 function getAckParam(jsonRpcParams: Partial<JSONRPCParams> | undefined) {
@@ -169,6 +159,19 @@ function getRecipientIDParam(
   return recipientID as string;
 }
 
+function getSenderAmountParam(
+    jsonRpcParams: Partial<JSONRPCParams> | undefined
+): RgbInvoiceValue | undefined {
+    const key = "sender_amount";
+    if (isDictionary(jsonRpcParams) && key in jsonRpcParams) {
+        const amount = jsonRpcParams[key];
+        if (isDictionary(amount)) {
+            return amount as RgbInvoiceValue;
+        }
+    }
+    return undefined;
+}
+
 function getTxidParam(jsonRpcParams: Partial<JSONRPCParams> | undefined) {
   const txidKey = "txid";
   if (!isDictionary(jsonRpcParams) || !(txidKey in jsonRpcParams)) {
@@ -204,6 +207,7 @@ function getConsignment(recipientID: string): Consignment | null {
       txid: result.txid,
       vout: result.vout ?? undefined,
       ack: result.ack !== null ? Boolean(result.ack) : undefined,
+      sender_amount: result.sender_amount,
     };
   } else {
     return null;
@@ -232,6 +236,25 @@ interface ServerParams {
   file: Express.Multer.File | undefined;
 }
 
+function joinEntries(entries: object) {
+  let joined = "<";
+  let keysCount = Object.keys(entries).length;
+  Object.entries(entries).forEach(([k, v]) => {
+    let value = v;
+    if (isDictionary(v)) {
+        value = JSON.stringify(v);
+    } else if (isString(v)) {
+      value = truncateText(v as string);
+    }
+    joined += `${k}: ${value}`;
+    keysCount--;
+    if (keysCount > 0) {
+      joined += ", ";
+    }
+  });
+  return joined + ">";
+}
+
 const jsonRpcServer: JSONRPCServer<ServerParams> =
   new JSONRPCServer<ServerParams>({
     errorListener: () => {
@@ -257,10 +280,16 @@ jsonRpcServer.addMethod(
     const fileBuffer = fs.readFileSync(
       path.join(consignmentDir, consignment.filename)
     );
+
+    const senderAmount = consignment.sender_amount
+      ? JSON.parse(consignment.sender_amount)
+      : undefined;
+
     return {
       consignment: fileBuffer.toString("base64"),
       txid: consignment.txid,
       vout: consignment.vout,
+      sender_amount: senderAmount,
     };
   }
 );
@@ -276,6 +305,7 @@ jsonRpcServer.addMethod(
       const recipientID = getRecipientIDParam(jsonRpcParams);
       const txid = getTxidParam(jsonRpcParams);
       const vout = getVoutParam(jsonRpcParams);
+      const senderAmount = getSenderAmountParam(jsonRpcParams);
       const uploadedFile = path.join(tempDir, file.filename);
       const fileHash = genHashFromFile(uploadedFile);
       const prevFile = getConsignment(recipientID);
@@ -289,10 +319,10 @@ jsonRpcServer.addMethod(
       }
       fs.renameSync(uploadedFile, path.join(consignmentDir, fileHash));
       const insert = db.prepare(
-        `INSERT INTO consignments (recipient_id, filename, txid, vout, ack)
-         VALUES (?, ?, ?, ?, ?)`
+        `INSERT INTO consignments (recipient_id, filename, txid, vout, ack, sender_amount)
+         VALUES (?, ?, ?, ?, ?, ?)`
       );
-      insert.run(recipientID, fileHash, txid, vout, null);
+      insert.run(recipientID, fileHash, txid, vout, null, senderAmount ? JSON.stringify(senderAmount) : null);
       return true;
     } catch (e: unknown) {
       if (file) {
@@ -386,7 +416,6 @@ jsonRpcServer.addMethod(
 );
 
 export const loadApiEndpoints = (app: Application): void => {
-  // setup app directories
   appDir = process.env.APP_DATA || path.join(homedir(), DEFAULT_APP_DATA);
   setDir(appDir);
   tempDir = path.join(appDir, "tmp");
@@ -396,7 +425,6 @@ export const loadApiEndpoints = (app: Application): void => {
   setDir(consignmentDir);
   setDir(mediaDir);
 
-  // setup DB
   db = new DatabaseConstructor(path.join(appDir, DATABASE_FILE), {});
   db.pragma("journal_mode = WAL");
   const createConsignmentsTable = db.prepare(
@@ -406,6 +434,7 @@ export const loadApiEndpoints = (app: Application): void => {
        filename TEXT NOT NULL,
        txid TEXT NOT NULL,
        vout INTEGER,
+       sender_amount TEXT,
        ack INTEGER
      )`
   );
@@ -419,12 +448,17 @@ export const loadApiEndpoints = (app: Application): void => {
   );
   createMediaTable.run();
 
-  // setup app route
+  try {
+    db.prepare("SELECT sender_amount FROM consignments LIMIT 1").get();
+  } catch (e) {
+    logger.info("Upgrading database: adding sender_amount column to consignments table...");
+    db.prepare("ALTER TABLE consignments ADD COLUMN sender_amount TEXT").run();
+  }
+
   app.post(
     "/json-rpc",
     upload.single("file"),
     async (req: Request, res: Response) => {
-      // request logs
       const jsonRPCRequest = req.body;
       let reqParams = "";
       if (jsonRPCRequest.params !== null) {
@@ -440,13 +474,11 @@ export const loadApiEndpoints = (app: Application): void => {
       httpContext.set("clientID", jsonRPCRequest.id);
       logger.info("", { req });
 
-      // call API method
       const file = req.file;
       jsonRpcServer
         .receive(jsonRPCRequest, { file })
         .then((jsonRPCResponse) => {
           if (jsonRPCResponse) {
-            // response logs
             let response = "";
             if (isErrorResponse(jsonRPCResponse)) {
               response =
@@ -469,14 +501,11 @@ export const loadApiEndpoints = (app: Application): void => {
             }
             httpContext.set("response", response);
 
-            // send response to client
             res.json(jsonRPCResponse);
           } else {
-            // notification
             res.sendStatus(204);
           }
 
-          // delete possibly unhandled file
           if (file) {
             const unhandledFile = path.join(tempDir, file.filename);
             if (fs.existsSync(unhandledFile)) {
