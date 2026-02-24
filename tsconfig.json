@@ -6,9 +6,12 @@
     "target": "es6",
     "strict": true,
     "moduleResolution": "node",
+    "ignoreDeprecations": "6.0",
     "sourceMap": true,
     "outDir": "dist",
-    "resolveJsonModule": true
+    "rootDir": ".",
+    "resolveJsonModule": true,
+    "types": ["node", "jest"]
   },
-  "include": ["src/**/*"]
+  "include": ["src/**/*.ts", "test/**/*.ts"]
 }

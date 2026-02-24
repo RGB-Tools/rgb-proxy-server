@@ -101,7 +101,7 @@ function isString(data: unknown): data is string {
 }
 
 function isErrorResponse(
-  object: JSONRPCResponse
+  object: JSONRPCResponse,
 ): object is JSONRPCErrorResponse {
   return "error" in object;
 }
@@ -142,7 +142,7 @@ function getAckParam(jsonRpcParams: Partial<JSONRPCParams> | undefined) {
 }
 
 function getAttachmentIDParam(
-  jsonRpcParams: Partial<JSONRPCParams> | undefined
+  jsonRpcParams: Partial<JSONRPCParams> | undefined,
 ) {
   const attachmentIDKey = "attachment_id";
   if (!isDictionary(jsonRpcParams) || !(attachmentIDKey in jsonRpcParams)) {
@@ -156,7 +156,7 @@ function getAttachmentIDParam(
 }
 
 function getRecipientIDParam(
-  jsonRpcParams: Partial<JSONRPCParams> | undefined
+  jsonRpcParams: Partial<JSONRPCParams> | undefined,
 ) {
   const recipientIDKey = "recipient_id";
   if (!isDictionary(jsonRpcParams) || !(recipientIDKey in jsonRpcParams)) {
@@ -211,7 +211,7 @@ function getConsignment(recipientID: string): Consignment | null {
 }
 
 function getConsignmentOrFail(
-  jsonRpcParams: Partial<JSONRPCParams> | undefined
+  jsonRpcParams: Partial<JSONRPCParams> | undefined,
 ): Consignment {
   const recipientID = getRecipientIDParam(jsonRpcParams);
   const consignment = getConsignment(recipientID);
@@ -247,7 +247,7 @@ jsonRpcServer.addMethod(
       version: APP_VERSION,
       uptime: Math.trunc(process.uptime()),
     };
-  }
+  },
 );
 
 jsonRpcServer.addMethod(
@@ -255,14 +255,14 @@ jsonRpcServer.addMethod(
   async (jsonRpcParams, _serverParams): Promise<ConsignmentGetRes> => {
     const consignment = getConsignmentOrFail(jsonRpcParams);
     const fileBuffer = fs.readFileSync(
-      path.join(consignmentDir, consignment.filename)
+      path.join(consignmentDir, consignment.filename),
     );
     return {
       consignment: fileBuffer.toString("base64"),
       txid: consignment.txid,
       vout: consignment.vout,
     };
-  }
+  },
 );
 
 jsonRpcServer.addMethod(
@@ -290,7 +290,7 @@ jsonRpcServer.addMethod(
       fs.renameSync(uploadedFile, path.join(consignmentDir, fileHash));
       const insert = db.prepare(
         `INSERT INTO consignments (recipient_id, filename, txid, vout, ack)
-         VALUES (?, ?, ?, ?, ?)`
+         VALUES (?, ?, ?, ?, ?)`,
       );
       insert.run(recipientID, fileHash, txid, vout, null);
       return true;
@@ -303,7 +303,7 @@ jsonRpcServer.addMethod(
       }
       throw e;
     }
-  }
+  },
 );
 
 jsonRpcServer.addMethod(
@@ -316,7 +316,7 @@ jsonRpcServer.addMethod(
     }
     const fileBuffer = fs.readFileSync(path.join(mediaDir, media.filename));
     return fileBuffer.toString("base64");
-  }
+  },
 );
 
 jsonRpcServer.addMethod(
@@ -341,7 +341,7 @@ jsonRpcServer.addMethod(
       }
       fs.renameSync(uploadedFile, path.join(mediaDir, fileHash));
       const insert = db.prepare(
-        "INSERT INTO media (attachment_id, filename) VALUES (?, ?)"
+        "INSERT INTO media (attachment_id, filename) VALUES (?, ?)",
       );
       insert.run(attachmentID, fileHash);
       return true;
@@ -354,7 +354,7 @@ jsonRpcServer.addMethod(
       }
       throw e;
     }
-  }
+  },
 );
 
 jsonRpcServer.addMethod(
@@ -362,7 +362,7 @@ jsonRpcServer.addMethod(
   async (jsonRpcParams, _serverParams): Promise<boolean | undefined> => {
     const consignment = getConsignmentOrFail(jsonRpcParams);
     return consignment.ack;
-  }
+  },
 );
 
 jsonRpcServer.addMethod(
@@ -378,11 +378,11 @@ jsonRpcServer.addMethod(
       }
     }
     const update = db.prepare(
-      "UPDATE consignments SET ack = ? WHERE recipient_id = ?"
+      "UPDATE consignments SET ack = ? WHERE recipient_id = ?",
     );
     update.run(ack ? 1 : 0, consignment.recipientID);
     return true;
-  }
+  },
 );
 
 export const loadApiEndpoints = (app: Application): void => {
@@ -407,7 +407,7 @@ export const loadApiEndpoints = (app: Application): void => {
        txid TEXT NOT NULL,
        vout INTEGER,
        ack INTEGER
-     )`
+     )`,
   );
   createConsignmentsTable.run();
   const createMediaTable = db.prepare(
@@ -415,7 +415,7 @@ export const loadApiEndpoints = (app: Application): void => {
        id INTEGER PRIMARY KEY AUTOINCREMENT,
        attachment_id TEXT NOT NULL UNIQUE,
        filename TEXT NOT NULL
-     )`
+     )`,
   );
   createMediaTable.run();
 
@@ -485,6 +485,6 @@ export const loadApiEndpoints = (app: Application): void => {
             }
           }
         });
-    }
+    },
   );
 };

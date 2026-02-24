@@ -1,4 +1,4 @@
-FROM node:20-bookworm-slim
+FROM node:24-trixie-slim
 
 RUN apt-get -y update \
     && apt-get -y install tini \
@@ -21,4 +21,4 @@ ENV NODE_ENV="production"
 
 EXPOSE 3000/tcp
 
-CMD ["tini", "--", "node", "./dist/server.js"]
+CMD ["tini", "--", "node", "./dist/src/server.js"]

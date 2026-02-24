@@ -154,7 +154,7 @@ approval cannot be changed once submitted.
 
 ```sh
 # install dependencies
-npm run install
+npm install
 
 # run test suite
 npm run test

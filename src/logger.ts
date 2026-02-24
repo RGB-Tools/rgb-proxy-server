@@ -1,3 +1,4 @@
+import { type Request } from "express";
 import httpContext from "express-http-context";
 import winston from "winston";
 
@@ -21,9 +22,10 @@ export const logger = winston.createLogger({
 
       if (info.req) {
         arrow = "->";
-        const clientIP = info.req.headers["x-forwarded-for"]
-          ? info.req.headers["x-forwarded-for"]
-          : info.req.ip;
+        const req = info.req as Request;
+        const clientIP = req.headers["x-forwarded-for"]
+          ? req.headers["x-forwarded-for"]
+          : req.ip;
         let ip = "";
         if (clientIP) {
           ip = `${clientIP} `;
@@ -34,7 +36,7 @@ export const logger = winston.createLogger({
         if (reqParams) {
           params = `${reqParams} `;
         }
-        const userAgent = info.req.headers["user-agent"] || "";
+        const userAgent = req.headers["user-agent"] || "";
         extra = ` ${ip}${apiMethod} ${params}${userAgent}`;
       } else if (info.isFromMorgan) {
         arrow = "<-";
@@ -45,7 +47,7 @@ export const logger = winston.createLogger({
       }
 
       return `${prefix}${arrow} ${reqIDs}${extra} ${info.message}`;
-    })
+    }),
   ),
   levels: winston.config.syslog.levels,
   level,
