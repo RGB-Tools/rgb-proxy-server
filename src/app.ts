@@ -45,7 +45,8 @@ app.use(
 
 // Express configuration
 app.set("port", process.env.PORT || 3000);
-app.use(express.json());
+// The JSON body parser is set up in loadApiEndpoints, as its size limit
+// depends on the API configuration
 app.use(express.urlencoded({ extended: true }));
 
 export default app;

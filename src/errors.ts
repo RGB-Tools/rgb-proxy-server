@@ -1,85 +1,154 @@
 import { JSONRPCErrorException } from "json-rpc-2.0";
 
-export class CannotChangeAck extends JSONRPCErrorException {
-  constructor(data?: object) {
-    super("Cannot change ACK", -100, data);
+// -1xx: state / uniqueness errors
+
+export class CannotChange extends JSONRPCErrorException {
+  constructor(fields: string[] = [], data?: object) {
+    super("Cannot change", -100, data ?? { fields });
   }
 }
 
-export class CannotChangeUploadedFile extends JSONRPCErrorException {
+export class InvoiceNotReserved extends JSONRPCErrorException {
   constructor(data?: object) {
-    super("Cannot change uploaded file", -101, data);
+    super("Invoice not reserved", -101, data);
   }
 }
 
-export class InvalidAck extends JSONRPCErrorException {
+export class TransferIdInUse extends JSONRPCErrorException {
   constructor(data?: object) {
-    super("Invalid ACK", -200, data);
+    super("Transfer ID in use", -102, data);
   }
 }
 
-export class InvalidAttachmentID extends JSONRPCErrorException {
+export class OperationNotFound extends JSONRPCErrorException {
   constructor(data?: object) {
-    super("Invalid attachment ID", -201, data);
+    super("Operation not found", -104, data);
   }
 }
 
-export class InvalidRecipientID extends JSONRPCErrorException {
+export class OperationExpired extends JSONRPCErrorException {
   constructor(data?: object) {
-    super("Invalid recipient ID", -202, data);
+    super("Operation expired", -105, data);
   }
 }
 
-export class InvalidTxid extends JSONRPCErrorException {
+export class AlreadyAcked extends JSONRPCErrorException {
   constructor(data?: object) {
-    super("Invalid TXID", -203, data);
+    super("Already acked", -107, data);
   }
 }
 
-export class InvalidVout extends JSONRPCErrorException {
+export class FileTooLarge extends JSONRPCErrorException {
   constructor(data?: object) {
-    super("Invalid vout", -204, data);
+    super("File too large", -108, data);
   }
 }
 
-export class MissingAck extends JSONRPCErrorException {
+export class TooManyTransfers extends JSONRPCErrorException {
   constructor(data?: object) {
-    super("Missing ACK", -300, data);
+    super("Too many transfers", -109, data);
   }
 }
 
-export class MissingAttachmentID extends JSONRPCErrorException {
+export class SignedTxTooLarge extends JSONRPCErrorException {
   constructor(data?: object) {
-    super("Missing attachment ID", -301, data);
+    super("Signed TX too large", -110, data);
   }
 }
 
-export class MissingRecipientID extends JSONRPCErrorException {
+export class InvoiceExpired extends JSONRPCErrorException {
   constructor(data?: object) {
-    super("Missing recipient ID", -302, data);
+    super("Invoice expired", -111, data);
+  }
+}
+
+export class InvoiceQuotaExceeded extends JSONRPCErrorException {
+  constructor(data?: object) {
+    super("Invoice quota exceeded", -112, data);
+  }
+}
+
+export class TransferIdDeleted extends JSONRPCErrorException {
+  constructor(data?: object) {
+    super("Transfer ID deleted", -113, data);
+  }
+}
+
+// Reports the difficulty currently required, so the sender can retry
+export class InvalidProofOfWork extends JSONRPCErrorException {
+  constructor(powDifficulty: number, data?: object) {
+    super(
+      "Invalid proof of work",
+      -114,
+      data ?? { pow_difficulty: String(powDifficulty) },
+    );
+  }
+}
+
+// -2xx: invalid parameter errors
+
+export class Invalid extends JSONRPCErrorException {
+  constructor(fields: string[], data?: object) {
+    super("Invalid", -200, data ?? { fields });
+  }
+}
+
+// -3xx: missing parameter errors
+
+export class Missing extends JSONRPCErrorException {
+  constructor(fields: string[], data?: object) {
+    super("Missing", -300, data ?? { fields });
   }
 }
 
 export class MissingFile extends JSONRPCErrorException {
   constructor(data?: object) {
-    super("Missing file", -303, data);
+    super("Missing file", -301, data);
   }
 }
 
-export class MissingTxid extends JSONRPCErrorException {
-  constructor(data?: object) {
-    super("Missing TXID", -303, data);
-  }
-}
+// -4xx: not-found errors
 
 export class NotFoundConsignment extends JSONRPCErrorException {
   constructor(data?: object) {
-    super("Consignment file not found", -400, data);
+    super("Consignment not found", -400, data);
   }
 }
 
 export class NotFoundMedia extends JSONRPCErrorException {
   constructor(data?: object) {
-    super("Media file not found", -401, data);
+    super("Media not found", -401, data);
+  }
+}
+
+export class TransferNotFound extends JSONRPCErrorException {
+  constructor(data?: object) {
+    super("Transfer not found", -402, data);
+  }
+}
+
+export class TransferDataRetrieved extends JSONRPCErrorException {
+  constructor(data?: object) {
+    super("Transfer data retrieved", -403, data);
+  }
+}
+
+// -5xx: security errors
+
+export class InvalidProxyAuthSignature extends JSONRPCErrorException {
+  constructor(data?: object) {
+    super("Invalid proxy auth signature", -501, data);
+  }
+}
+
+export class InvalidEndpointAuthSignature extends JSONRPCErrorException {
+  constructor(data?: object) {
+    super("Invalid endpoint auth signature", -502, data);
+  }
+}
+
+export class InvalidContentSignature extends JSONRPCErrorException {
+  constructor(data?: object) {
+    super("Invalid content signature", -503, data);
   }
 }
