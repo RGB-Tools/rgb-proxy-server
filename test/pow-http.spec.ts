@@ -5,6 +5,7 @@ import request from "supertest";
 
 import app from "../src/app";
 import {
+  closeApiEndpoints,
   deriveTransferId,
   hashUtf8Message,
   loadApiEndpoints,
@@ -81,6 +82,7 @@ process.env.MAX_QUOTA = "10";
 loadApiEndpoints(app);
 
 afterAll(() => {
+  closeApiEndpoints();
   return fs.promises.rm(tempDir, { recursive: true, force: true });
 });
 

@@ -5,7 +5,11 @@ import path from "path";
 import request from "supertest";
 
 import app from "../src/app";
-import { hashUtf8Message, loadApiEndpoints } from "../src/controllers/api";
+import {
+  closeApiEndpoints,
+  hashUtf8Message,
+  loadApiEndpoints,
+} from "../src/controllers/api";
 
 const jsonrpcVersion = "2.0";
 const okStatus = 200;
@@ -71,6 +75,7 @@ process.env.PROXY_AUTH_PUBKEYS = `${allowed.pubkeyHex}, ${otherAllowed.pubkeyHex
 loadApiEndpoints(app);
 
 afterAll(() => {
+  closeApiEndpoints();
   return fs.promises.rm(tempDir, { recursive: true, force: true });
 });
 

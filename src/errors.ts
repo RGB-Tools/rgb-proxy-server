@@ -85,6 +85,14 @@ export class InvalidProofOfWork extends JSONRPCErrorException {
   }
 }
 
+// Returned by the calls that would start a new transfer while the server is
+// draining, see README
+export class ServerDraining extends JSONRPCErrorException {
+  constructor(data?: object) {
+    super("Server draining", -115, data);
+  }
+}
+
 // -2xx: invalid parameter errors
 
 export class Invalid extends JSONRPCErrorException {

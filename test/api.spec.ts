@@ -5,6 +5,7 @@ import request from "supertest";
 
 import app from "../src/app";
 import {
+  closeApiEndpoints,
   deriveTransferId,
   hashUtf8Message,
   loadApiEndpoints,
@@ -40,6 +41,7 @@ process.env.POW_GLOBAL_THRESHOLD = "1000000";
 loadApiEndpoints(app);
 
 afterAll(() => {
+  closeApiEndpoints();
   return fs.promises.rm(tempDir, { recursive: true, force: true });
 });
 

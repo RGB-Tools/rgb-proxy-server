@@ -1,0 +1,164 @@
+import fs from "fs";
+import path from "path";
+
+import app from "../src/app";
+import {
+  closeApiEndpoints,
+  countPending,
+  loadApiEndpoints,
+  startDraining,
+} from "../src/controllers/api";
+import {
+  ackOperation,
+  apiClient,
+  appTransport,
+  invoiceIdOf,
+  newTransfer,
+  nowSecs,
+  randomId,
+} from "./helpers";
+
+// Draining can't be undone, so this suite has its own module registry and
+// the "drain mode" tests must stay after the ones needing a non draining
+// server
+
+const tempDir = fs.mkdtempSync(path.join(__dirname, "temp-drain-"));
+process.env.APP_DATA = path.join(tempDir, "app-data");
+// The proof of work stays disabled, see pow-http.spec.ts for it
+process.env.POW_RATE_THRESHOLD = "1000000";
+process.env.POW_GLOBAL_THRESHOLD = "1000000";
+
+loadApiEndpoints(app);
+
+afterAll(() => {
+  closeApiEndpoints();
+  return fs.promises.rm(tempDir, { recursive: true, force: true });
+});
+
+const {
+  rpc,
+  prepareInvoice,
+  postConsignment,
+  postMedia,
+  transferList,
+  transferAction,
+  invoiceStatus,
+  ackPrepare,
+  ackPost,
+  ackGet,
+} = apiClient(appTransport(app));
+
+describe("countPending", () => {
+  it("counts transfers until they are retrieved or deleted", async () => {
+    const before = countPending();
+    const invoice = await prepareInvoice("2");
+    expect(countPending()).toBe(before);
+
+    const t1 = newTransfer(invoice.invoiceId);
+    const t2 = newTransfer(invoice.invoiceId);
+    await postConsignment(t1, "one");
+    await postConsignment(t2, "two");
+    expect(countPending()).toBe(before + 2);
+
+    await transferAction("retrieved", t1.transferId, invoice.recipient);
+    expect(countPending()).toBe(before + 1);
+    await transferAction("delete", t2.transferId, invoice.recipient);
+    expect(countPending()).toBe(before);
+  });
+
+  it("counts ack operations until answered and fetched, or expired", async () => {
+    const before = countPending();
+
+    const acked = await ackPrepare(2);
+    expect(countPending()).toBe(before + 1);
+    await ackPost(acked.transfers[0], true);
+    await ackPost(acked.transfers[1], true);
+    // Answered, but the sender has not retrieved the responses yet
+    expect(countPending()).toBe(before + 1);
+    await ackGet(acked, [acked.transfers[0].transferId]);
+    expect(countPending()).toBe(before + 1);
+    await ackGet(acked);
+    expect(countPending()).toBe(before);
+
+    // NACKs have to be retrieved too
+    const nacked = await ackPrepare(2);
+    await ackPost(nacked.transfers[0], false);
+    await ackPost(nacked.transfers[1], false);
+    expect(countPending()).toBe(before + 1);
+    await ackGet(nacked);
+    expect(countPending()).toBe(before);
+
+    // An unanswered operation is pending until it expires
+    await ackPrepare(1);
+    expect(countPending(nowSecs() + 3599)).toBe(
+      countPending(nowSecs() + 3601) + 1,
+    );
+  });
+});
+
+describe("drain mode", () => {
+  it("refuses new transfers and keeps completing pending ones", async () => {
+    const invoice = await prepareInvoice();
+    const transfer = newTransfer(invoice.invoiceId);
+    expect((await postConsignment(transfer, "pending")).result).toBe(true);
+    const op = await ackPrepare(2);
+    const pending = countPending();
+
+    startDraining();
+
+    const draining = -115;
+    const invoiceParams = {
+      invoice_id: invoice.invoiceId,
+      expires_at: invoice.expiresAt,
+      recipient_pk: invoice.recipient.pubkeyHex,
+    };
+
+    // New calls starting a transfer fail...
+    const newInvoice = await rpc("invoice.prepare", {
+      ...invoiceParams,
+      invoice_id: invoiceIdOf(randomId(), invoice.recipient.pubkeyHex),
+    });
+    expect(newInvoice.error.code).toBe(draining);
+    const newConsignment = await postConsignment(
+      newTransfer(invoice.invoiceId),
+      "new",
+    );
+    expect(newConsignment.error.code).toBe(draining);
+    const newOp = await rpc("ack.prepare", ackOperation().params);
+    expect(newOp.error.code).toBe(draining);
+
+    // ...while repeating accepted ones is still idempotent
+    expect((await rpc("invoice.prepare", invoiceParams)).result).toBe(false);
+    expect((await postConsignment(transfer, "pending")).result).toBe(false);
+    expect((await rpc("ack.prepare", op.params)).result).toBe(false);
+
+    // Calls reading or completing pending transfers keep working
+    expect((await rpc("server.info", {})).result).toBeDefined();
+    expect(await invoiceStatus(invoice.invoiceId)).toBeDefined();
+    expect((await transferList(invoice)).result).toBeDefined();
+    expect((await ackGet(op)).result).toBeDefined();
+    expect((await postMedia(transfer, "a".repeat(64), "media")).result).toBe(
+      true,
+    );
+    expect(
+      (
+        await transferAction(
+          "retrieved",
+          transfer.transferId,
+          invoice.recipient,
+        )
+      ).result,
+    ).toBe(true);
+    for (const t of op.transfers) {
+      expect((await ackPost(t, true)).error).toBeUndefined();
+    }
+
+    // The recipient is done, but the sender has not retrieved the responses
+    expect(countPending()).toBe(pending - 1);
+    expect((await ackGet(op)).result.acks).toEqual({
+      [op.transfers[0].transferId]: true,
+      [op.transfers[1].transferId]: true,
+    });
+    expect(countPending()).toBe(pending - 2);
+  });
+});

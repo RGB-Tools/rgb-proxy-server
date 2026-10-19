@@ -142,27 +142,53 @@ set `APP_DATA` to its path inside the container.
 
 Stored under `$HOME/.rgb-proxy-server` by default. Override with `APP_DATA`.
 
+### Graceful shutdown and drain mode
+
+On `SIGTERM`/`SIGINT` the server stops accepting connections, lets pending
+calls complete (up to `SHUTDOWN_TIMEOUT_SECS`) and exits, so it can be safely
+stopped (e.g. for maintenance).
+
+On `SIGUSR2` the server enters drain mode, meant to retire an instance (e.g.
+once a replacement is running):
+
+- calls starting a new transfer (`invoice.prepare`, `consignment.post`,
+  `ack.prepare`) fail with error `-115`, except for repeats of calls already
+  accepted, which still return `false`
+- every other call keeps working, so pending transfers can be completed
+- once there are no pending items, the server shuts down gracefully, checking
+  every 5 seconds. Pending items are the transfers neither retrieved nor
+  deleted, and the ack operations with transfers that a recipient can still
+  answer (operation not expired) or answers (ACKs and NACKs) that the sender
+  has not yet retrieved with `ack.get`
+
+Pending items can last until the invoice or operation expiration, plus
+`RETENTION_GRACE_SECS` if they are never retrieved, so `DRAIN_TIMEOUT_SECS` can
+be set to cap the wait. A `SIGTERM`/`SIGINT` during a drain transitions the server
+to a graceful shutdown.
+
 ## Configuration
 
 Environment variables (see `.env-sample`):
 
-| Variable               | Default               | Description                                                                                                                          |
-| ---------------------- | --------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
-| `APP_DATA`             | `~/.rgb-proxy-server` | Data directory                                                                                                                       |
-| `MAX_EXPIRY_SECS`      | `2592000` (30 days)   | Max allowed `expires_at` offset                                                                                                      |
-| `MAX_QUOTA`            | `100`                 | Max number of transfers an invoice can be reserved for                                                                               |
-| `MAX_UPLOAD_BYTES`     | `104857600` (100 MiB) | Max consignment/media upload size (`max_file_size`)                                                                                  |
-| `MAX_SIGNED_TX_SIZE`   | `153600` (150 KiB)    | Max per-transfer signed TX in `ack.prepare`, measured as the length of the base64 `signed_tx` string (`max_signed_tx_size`)          |
-| `MAX_TRANSFERS`        | `1000`                | Max transfers per `ack.prepare` operation (`max_transfers`)                                                                          |
-| `RETENTION_GRACE_SECS` | `86400` (1 day)       | Time data is kept after its expiration (max for pending transfers, always for operation data: ACKs, signatures, released signed TXs) |
-| `MAX_POW_DIFFICULTY`   | `24`                  | Max proof of work difficulty (leading zero bits) required on `consignment.post`, `0` disables the proof of work                      |
-| `POW_RATE_THRESHOLD`   | `10`                  | Recent `consignment.post` calls for an invoice at which its difficulty becomes 1                                                     |
-| `POW_RATE_STEP`        | `2`                   | Further recent calls for an invoice for each additional bit                                                                          |
-| `POW_GLOBAL_THRESHOLD` | `1000`                | Recent `consignment.post` calls across all invoices at which the difficulty of every invoice becomes 1                               |
-| `POW_GLOBAL_STEP`      | `50`                  | Further recent calls across all invoices for each additional bit                                                                     |
-| `POW_WINDOW_SECS`      | `3600` (1 hour)       | Time constant of the decay of the call counts (calls are counted over about this window)                                             |
-| `POW_HOLD_SECS`        | `600` (10 minutes)    | Min time a difficulty stays in effect before it can decrease                                                                         |
-| `PROXY_AUTH_PUBKEYS`   | _(none)_              | Comma-separated Ed25519 pubkeys (hex); when set, `invoice.prepare` and `ack.prepare` require a valid signature                       |
+| Variable                | Default               | Description                                                                                                                                                                                                   |
+| ----------------------- | --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `APP_DATA`              | `~/.rgb-proxy-server` | Data directory                                                                                                                                                                                                |
+| `MAX_EXPIRY_SECS`       | `2592000` (30 days)   | Max allowed `expires_at` offset                                                                                                                                                                               |
+| `MAX_QUOTA`             | `100`                 | Max number of transfers an invoice can be reserved for                                                                                                                                                        |
+| `MAX_UPLOAD_BYTES`      | `104857600` (100 MiB) | Max consignment/media upload size (`max_file_size`)                                                                                                                                                           |
+| `MAX_SIGNED_TX_SIZE`    | `153600` (150 KiB)    | Max per-transfer signed TX in `ack.prepare`, measured as the length of the base64 `signed_tx` string (`max_signed_tx_size`)                                                                                   |
+| `MAX_TRANSFERS`         | `1000`                | Max transfers per `ack.prepare` operation (`max_transfers`)                                                                                                                                                   |
+| `RETENTION_GRACE_SECS`  | `86400` (1 day)       | Time data is kept after its expiration (max for pending transfers, always for operation data: ACKs, signatures, released signed TXs)                                                                          |
+| `MAX_POW_DIFFICULTY`    | `24`                  | Max proof of work difficulty (leading zero bits) required on `consignment.post`, `0` disables the proof of work                                                                                               |
+| `POW_RATE_THRESHOLD`    | `10`                  | Recent `consignment.post` calls for an invoice at which its difficulty becomes 1                                                                                                                              |
+| `POW_RATE_STEP`         | `2`                   | Further recent calls for an invoice for each additional bit                                                                                                                                                   |
+| `POW_GLOBAL_THRESHOLD`  | `1000`                | Recent `consignment.post` calls across all invoices at which the difficulty of every invoice becomes 1                                                                                                        |
+| `POW_GLOBAL_STEP`       | `50`                  | Further recent calls across all invoices for each additional bit                                                                                                                                              |
+| `POW_WINDOW_SECS`       | `3600` (1 hour)       | Time constant of the decay of the call counts (calls are counted over about this window)                                                                                                                      |
+| `POW_HOLD_SECS`         | `600` (10 minutes)    | Min time a difficulty stays in effect before it can decrease                                                                                                                                                  |
+| `SHUTDOWN_TIMEOUT_SECS` | `300` (5 minutes)     | On SIGTERM/SIGINT the server stops accepting new connections and waits up to this long for pending calls before aborting them; the orchestrator grace period (e.g. `docker stop -t`) must be at least as long |
+| `DRAIN_TIMEOUT_SECS`    | _(none)_              | Max time a drain waits for pending transfers before shutting down anyway; unset waits indefinitely                                                                                                            |
+| `PROXY_AUTH_PUBKEYS`    | _(none)_              | Comma-separated Ed25519 pubkeys (hex); when set, `invoice.prepare` and `ack.prepare` require a valid signature                                                                                                |
 
 With the default proof of work settings, the difficulty of an invoice starts
 rising after about 10 transfers in an hour and reaches 24 bits at about 56,
@@ -217,6 +243,7 @@ Errors are returned as `{"code": <code>, "message": "<message>", "data": ...}`.
 | `-112` | Invoice quota exceeded          | `consignment.post`                                                                                                                                                |
 | `-113` | Transfer ID deleted             | `consignment.post` for a transfer deleted via `transfer.delete`                                                                                                   |
 | `-114` | Invalid proof of work           | `consignment.post`, `data.pow_difficulty` is the difficulty currently required                                                                                    |
+| `-115` | Server draining                 | `invoice.prepare`, `consignment.post`, `ack.prepare` for a new call while the server is draining (see drain mode)                                                 |
 | `-200` | Invalid                         | `data.fields` lists the invalid fields (including an out of window `timestamp`, a `file_size` not matching the uploaded file and a `file` sent before the params) |
 | `-300` | Missing                         | `data.fields` lists the missing fields, reported before the invalid ones                                                                                          |
 | `-301` | Missing file                    | upload with no `file`                                                                                                                                             |

@@ -30,6 +30,13 @@ app.use(function (req, res, next) {
   next();
 });
 
+// While shutting down, ask keep-alive clients to disconnect after their
+// current response
+app.use((_req, res, next) => {
+  if (app.get("shuttingDown")) res.set("Connection", "close");
+  next();
+});
+
 app.use(
   morgan(":status", {
     skip: (req, _res) => {

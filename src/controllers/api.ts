@@ -35,6 +35,7 @@ import {
   NotFoundMedia,
   OperationExpired,
   OperationNotFound,
+  ServerDraining,
   SignedTxTooLarge,
   TooManyTransfers,
   TransferDataRetrieved,
@@ -178,6 +179,9 @@ let upload: ReturnType<typeof multer>;
 
 let appDir: string;
 let db: Database;
+let gcTimer: NodeJS.Timeout | undefined;
+// Set when draining, see startDraining
+let draining = false;
 let tempDir: string;
 let consignmentDir: string;
 let mediaDir: string;
@@ -241,6 +245,9 @@ interface AckTransferRow {
   acked: number | null;
   // recipient signature of the response, null until posted
   ack_signature: string | null;
+  // Whether ack.get has returned the response, only used to know when a drain
+  // can complete (see countPending)
+  fetched: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -975,6 +982,7 @@ jsonRpcServer.addMethod(
       throw new CannotChange(changed);
     }
 
+    assertNotDraining();
     db.prepare(
       `INSERT INTO invoices (invoice_id, expiration, recipient_pk, quota)
        VALUES (?, ?, ?, ?)`,
@@ -1012,10 +1020,11 @@ jsonRpcServer.addMethod(
 // Calls are processed in the order required by the protocol:
 // 1. missing, then invalid parameters
 // 2. an identical re-post returns false, ignoring the proof of work
-// 3. reserved and not expired invoice, transfer ID derivation, signature,
+// 3. while draining, any other call fails
+// 4. reserved and not expired invoice, transfer ID derivation, signature,
 //    transfer ID not deleted (then changed data of an existing transfer)
-// 4. invoice quota
-// 5. proof of work, only if the current difficulty is greater than 0
+// 5. invoice quota
+// 6. proof of work, only if the current difficulty is greater than 0
 //
 // Only the calls creating a transfer count towards the proof of work
 // difficulty: they have passed every check, including the proof of work
@@ -1063,6 +1072,7 @@ jsonRpcServer.addMethod(
     if (live && changed.length === 0 && live.invoice_id === invoiceId) {
       return false; // idempotent, also after transfer.retrieved
     }
+    assertNotDraining();
 
     const invoice = getInvoice(invoiceId);
     if (!invoice) throw new InvoiceNotReserved();
@@ -1328,6 +1338,7 @@ jsonRpcServer.addMethod(
 
       if (existingRows.length === 0) {
         // All new: insert the operation and all its transfers
+        assertNotDraining();
         const opResult = db
           .prepare(
             `INSERT INTO ack_operations (expiration, signed_tx_hash, sender_pk)
@@ -1547,6 +1558,15 @@ jsonRpcServer.addMethod(
       signatures[r.transfer_id] = r.ack_signature;
     }
 
+    // Remember which responses have been retrieved, so that a drain can wait
+    // for the sender to get them (see countPending)
+    const markFetched = db.prepare(
+      "UPDATE ack_transfers SET fetched = 1 WHERE transfer_id = ?",
+    );
+    db.transaction(() => {
+      for (const tid of Object.keys(acks)) markFetched.run(tid);
+    })();
+
     // Calling ack.get doesn't trigger the deletion of the operation data,
     // which is kept until the retention grace after the expiration has passed
     // (see runGC), as recipients may still need to retrieve a released signed
@@ -1649,6 +1669,45 @@ export function runGC(now = nowSecs()): void {
       db.prepare("DELETE FROM ack_operations WHERE id = ?").run(id);
     })();
   }
+}
+
+// Start draining: calls that would start a new transfer (invoice.prepare,
+// consignment.post and ack.prepare, unless they repeat an already accepted
+// call) fail with ServerDraining, while the ones completing pending transfers
+// keep working
+export const startDraining = (): void => {
+  draining = true;
+};
+
+const assertNotDraining = (): void => {
+  if (draining) throw new ServerDraining();
+};
+
+// Number of pending items a drain has to wait for: transfers neither retrieved
+// nor deleted (the recipient still has to act on them), and ack operations
+// that either can still be answered (not expired, with transfers still
+// unanswered) or have responses, ACKs and NACKs alike, that the sender has not
+// retrieved with ack.get yet. Operations are removed by runGC after their
+// retention grace, which bounds the wait
+export function countPending(now = nowSecs()): number {
+  const transfers = (
+    db
+      .prepare("SELECT COUNT(*) AS n FROM transfers WHERE status = 'pending'")
+      .get() as { n: number }
+  ).n;
+  const operations = (
+    db
+      .prepare(
+        `SELECT COUNT(*) AS n FROM ack_operations o
+         WHERE EXISTS (
+           SELECT 1 FROM ack_transfers t
+           WHERE t.operation_id = o.id
+             AND ((t.acked IS NULL AND o.expiration > ?)
+                  OR (t.acked IS NOT NULL AND t.fetched = 0)))`,
+      )
+      .get(now) as { n: number }
+  ).n;
+  return transfers + operations;
 }
 
 // ---------------------------------------------------------------------------
@@ -1800,16 +1859,19 @@ export const loadApiEndpoints = (app: Application): void => {
        consignment_hash TEXT NOT NULL,
        signed_tx        TEXT,
        acked            INTEGER,
-       ack_signature    TEXT
+       ack_signature    TEXT,
+       fetched          INTEGER NOT NULL DEFAULT 0
      )`,
   ).run();
 
   // Run GC immediately on startup to clear any data that expired while the
   // server was down, then keep running it every 60 seconds.
   // .unref() prevents the timer from keeping the process alive when nothing
-  // else is running (e.g. in tests).
+  // else is running (e.g. in tests). The handle is kept so that
+  // closeApiEndpoints can stop the timer on shutdown.
   runGC();
-  setInterval(runGC, 60_000).unref();
+  gcTimer = setInterval(runGC, 60_000);
+  gcTimer.unref();
 
   // The largest legitimate JSON body is an ack.prepare call carrying
   // maxTransfers signed TXs of maxSignedTxSize each; bigger bodies are aborted
@@ -1887,6 +1949,14 @@ export const loadApiEndpoints = (app: Application): void => {
       sendResponse(res, internalErrorResponse());
     },
   );
+};
+
+// Release the resources held by the API: stop the GC and close the database
+// (checkpointing the WAL). Safe to call more than once
+export const closeApiEndpoints = () => {
+  clearInterval(gcTimer);
+  gcTimer = undefined;
+  if (db?.open) db.close();
 };
 
 function parseErrorResponse(): JSONRPCErrorResponse {

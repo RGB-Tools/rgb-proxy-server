@@ -1,9 +1,17 @@
 import dotenv from "dotenv";
 
 import app from "./app";
-import { loadApiEndpoints } from "./controllers/api";
+import {
+  closeApiEndpoints,
+  countPending,
+  loadApiEndpoints,
+  startDraining,
+} from "./controllers/api";
 
 dotenv.config();
+
+const DEFAULT_SHUTDOWN_TIMEOUT_SECS = 300;
+const DRAIN_CHECK_INTERVAL_MS = 5000;
 
 loadApiEndpoints(app);
 
@@ -18,5 +26,102 @@ const server = app.listen(app.get("port"), () => {
   );
   console.log("  Press CTRL-C to stop\n");
 });
+
+// While shutting down, a connection whose call was in flight when the shutdown
+// started becomes idle once the response is sent, and would otherwise be kept
+// open until the keep-alive timeout, delaying the exit
+server.on("request", (_req, res) => {
+  res.on("finish", () => {
+    if (app.get("shuttingDown"))
+      setImmediate(() => server.closeIdleConnections());
+  });
+});
+
+/**
+ * Graceful shutdown: stop accepting new connections, let pending calls
+ * complete, then release resources and exit. Calls still pending after
+ * SHUTDOWN_TIMEOUT_SECS are aborted (clients are expected to retry).
+ */
+const shutdown = (reason: string) => {
+  if (app.get("shuttingDown")) {
+    console.log(`${reason}, already shutting down`);
+    return;
+  }
+  app.set("shuttingDown", true);
+  clearDrainTimers();
+
+  const parsedTimeout = parseInt(process.env.SHUTDOWN_TIMEOUT_SECS ?? "", 10);
+  const timeoutSecs =
+    Number.isInteger(parsedTimeout) && parsedTimeout >= 0
+      ? parsedTimeout
+      : DEFAULT_SHUTDOWN_TIMEOUT_SECS;
+  console.log(
+    `${reason}, shutting down (waiting up to ${timeoutSecs}s for pending calls)`,
+  );
+
+  setTimeout(() => {
+    console.error("Shutdown timeout reached, aborting pending calls");
+    server.closeAllConnections();
+    closeApiEndpoints();
+    process.exit(1);
+  }, timeoutSecs * 1000).unref();
+
+  server.close((err) => {
+    closeApiEndpoints();
+    if (err) {
+      console.error(`Error closing the server: ${err}`);
+      process.exit(1);
+    }
+    console.log("Shutdown complete");
+    process.exit(0);
+  });
+  server.closeIdleConnections();
+};
+
+/**
+ * Drain mode, to retire an instance: calls starting a new transfer are refused,
+ * the ones completing pending transfers keep working, and the server shuts down
+ * gracefully once nothing is pending. Pending transfers can last until their
+ * expiration (plus the retention grace), so DRAIN_TIMEOUT_SECS can be set to
+ * cap the wait. SIGTERM/SIGINT during a drain transitions the server to a
+ * graceful shutdown.
+ */
+let drainCheckTimer: NodeJS.Timeout | undefined;
+let drainTimeoutTimer: NodeJS.Timeout | undefined;
+
+const clearDrainTimers = () => {
+  clearInterval(drainCheckTimer);
+  clearTimeout(drainTimeoutTimer);
+};
+
+const drain = () => {
+  if (drainCheckTimer || app.get("shuttingDown")) {
+    console.log("Received SIGUSR2, already draining or shutting down");
+    return;
+  }
+  startDraining();
+
+  const checkPending = () => {
+    if (countPending() === 0) shutdown("Drain complete");
+  };
+
+  const pending = countPending();
+  console.log(`Received SIGUSR2, draining (${pending} pending)`);
+  drainCheckTimer = setInterval(checkPending, DRAIN_CHECK_INTERVAL_MS);
+  drainCheckTimer.unref();
+  if (pending === 0) return shutdown("Drain complete");
+
+  const drainTimeoutSecs = parseInt(process.env.DRAIN_TIMEOUT_SECS ?? "", 10);
+  if (drainTimeoutSecs > 0) {
+    drainTimeoutTimer = setTimeout(() => {
+      shutdown(`Drain timeout reached (${countPending()} still pending)`);
+    }, drainTimeoutSecs * 1000);
+    drainTimeoutTimer.unref();
+  }
+};
+
+process.on("SIGTERM", () => shutdown("Received SIGTERM"));
+process.on("SIGINT", () => shutdown("Received SIGINT"));
+process.on("SIGUSR2", drain);
 
 export default server;
