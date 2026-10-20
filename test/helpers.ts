@@ -96,6 +96,27 @@ export async function waitFor(
   return condition();
 }
 
+// Whether the files held open by this process can be listed (Linux)
+export const hasProcFds = fs.existsSync("/proc/self/fd");
+
+// Files under the directory this process holds open, including the ones
+// already deleted (a leaked descriptor on an unlinked file isn't in the dir)
+export function openFilesUnder(dir: string): string[] {
+  const prefix = fs.realpathSync(dir) + path.sep;
+  const open: string[] = [];
+  for (const fd of fs.readdirSync("/proc/self/fd")) {
+    let target: string;
+    try {
+      target = fs.readlinkSync(path.join("/proc/self/fd", fd));
+    } catch {
+      continue; // closed meanwhile, e.g. the descriptor of the listing itself
+    }
+    target = target.replace(/ \(deleted\)$/, "");
+    if (target.startsWith(prefix)) open.push(target);
+  }
+  return open;
+}
+
 // ---------------------------------------------------------------------------
 // Suite setup
 // ---------------------------------------------------------------------------
@@ -250,6 +271,8 @@ export interface AckOperation {
   signedTxHash: string;
   expiresAt: string;
   params: Record<string, unknown>;
+  // The content of the file of ack.prepare: transfer ID to signed TX
+  signedTxs: Record<string, string>;
 }
 
 export function newTransfer(invoiceId: string): Transfer {
@@ -272,12 +295,13 @@ export function ackOperation(count = 1, expiresInSecs = 3600): AckOperation {
   const signedTxHash = sha256hex(randomId());
   const expiresAt = futureExpiresAt(expiresInSecs);
   const transferData: Record<string, object> = {};
+  const signedTxs: Record<string, string> = {};
   for (const t of transfers) {
     transferData[t.transferId] = {
       recipient_pk: t.recipient.pubkeyHex,
       consignment_hash: t.consignmentHash,
-      signed_tx: t.signedTx,
     };
+    signedTxs[t.transferId] = t.signedTx;
   }
   return {
     sender,
@@ -290,6 +314,7 @@ export function ackOperation(count = 1, expiresInSecs = 3600): AckOperation {
       signed_tx_hash: signedTxHash,
       sender_pk: sender.pubkeyHex,
     },
+    signedTxs,
   };
 }
 
@@ -350,7 +375,10 @@ export function apiClient(transport: Transport) {
       params.signature = sign(
         t.sender.privateKey,
         hashUtf8Message(
-          params.transfer_id + params.consignment_hash + sha256hex(content),
+          params.transfer_id +
+            params.consignment_hash +
+            sha256hex(content) +
+            "consignment",
         ),
       );
     }
@@ -371,7 +399,9 @@ export function apiClient(transport: Transport) {
         file_size: String(Buffer.byteLength(content)),
         signature: sign(
           signer.privateKey,
-          hashUtf8Message(t.transferId + mediaId + sha256hex(content)),
+          hashUtf8Message(
+            t.transferId + mediaId + sha256hex(content) + "media",
+          ),
         ),
       },
       content,
@@ -413,9 +443,28 @@ export function apiClient(transport: Transport) {
     return res.body.result[invoiceId].status;
   }
 
+  // ack.prepare carries the signed TXs in its file, given as an object or as
+  // the raw content
+  function ackPrepareRaw(
+    params: Record<string, unknown>,
+    signedTxs: Record<string, string> | string,
+  ) {
+    const content =
+      typeof signedTxs === "string" ? signedTxs : JSON.stringify(signedTxs);
+    return uploadJson(
+      "ack.prepare",
+      { file_size: String(Buffer.byteLength(content)), ...params },
+      content,
+    );
+  }
+
+  function ackPrepareOp(op: AckOperation) {
+    return ackPrepareRaw(op.params, op.signedTxs);
+  }
+
   async function ackPrepare(count = 1, expiresInSecs = 3600) {
     const op = ackOperation(count, expiresInSecs);
-    const res = await rpc("ack.prepare", op.params);
+    const res = await ackPrepareOp(op);
     expect(res.body.result).toBe(true);
     return op;
   }
@@ -452,6 +501,8 @@ export function apiClient(transport: Transport) {
     transferList,
     transferAction,
     invoiceStatus,
+    ackPrepareRaw,
+    ackPrepareOp,
     ackPrepare,
     ackPost,
     ackGet,

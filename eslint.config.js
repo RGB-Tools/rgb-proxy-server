@@ -46,6 +46,15 @@ module.exports = [
   {
     files: ["test/**/*.ts"],
     ...jestPlugin.configs["flat/recommended"],
+    rules: {
+      ...jestPlugin.configs["flat/recommended"].rules,
+      // Tests declared through a conditional alias of it, e.g. skipped where
+      // a feature is unavailable
+      "jest/no-standalone-expect": [
+        "error",
+        { additionalTestBlockFunctions: ["itIfProcFds"] },
+      ],
+    },
   },
   prettierRecommended,
 ];

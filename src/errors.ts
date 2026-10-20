@@ -44,9 +44,9 @@ export class FileTooLarge extends JSONRPCErrorException {
   }
 }
 
-export class TooManyTransfers extends JSONRPCErrorException {
+export class TooManyItems extends JSONRPCErrorException {
   constructor(data?: object) {
-    super("Too many transfers", -109, data);
+    super("Too many items", -109, data);
   }
 }
 
@@ -90,6 +90,12 @@ export class InvalidProofOfWork extends JSONRPCErrorException {
 export class ServerDraining extends JSONRPCErrorException {
   constructor(data?: object) {
     super("Server draining", -115, data);
+  }
+}
+
+export class TooManyMedia extends JSONRPCErrorException {
+  constructor(data?: object) {
+    super("Too many media", -116, data);
   }
 }
 

@@ -1,6 +1,7 @@
 import dotenv from "dotenv";
 
 import app from "./app";
+import { parseNonNegativeInt, parsePort } from "./config";
 import {
   closeApiEndpoints,
   countPending,
@@ -12,8 +13,38 @@ dotenv.config();
 
 const DEFAULT_SHUTDOWN_TIMEOUT_SECS = 300;
 const DRAIN_CHECK_INTERVAL_MS = 5000;
+// setTimeout fires after 1 ms for a delay above 2^31-1 ms, so the timeouts in
+// seconds can't exceed this (about 24.8 days)
+const MAX_TIMEOUT_SECS = 2147483;
 
-loadApiEndpoints(app);
+// An invalid configuration stops the startup. The error is reported here, with
+// a failure exit code, as the logger would only log it and let the process
+// exit successfully
+function exitOnStartupError(e: unknown): never {
+  console.error(`Startup failed: ${e instanceof Error ? e.message : e}`);
+  process.exit(1);
+}
+
+let shutdownTimeoutSecs: number;
+// 0: wait indefinitely
+let drainTimeoutSecs: number;
+try {
+  // Read after dotenv
+  app.set("port", parsePort());
+  shutdownTimeoutSecs = parseNonNegativeInt(
+    "SHUTDOWN_TIMEOUT_SECS",
+    DEFAULT_SHUTDOWN_TIMEOUT_SECS,
+    MAX_TIMEOUT_SECS,
+  );
+  drainTimeoutSecs = parseNonNegativeInt(
+    "DRAIN_TIMEOUT_SECS",
+    0,
+    MAX_TIMEOUT_SECS,
+  );
+  loadApiEndpoints(app);
+} catch (e) {
+  exitOnStartupError(e);
+}
 
 /**
  * Start Express server.
@@ -50,11 +81,7 @@ const shutdown = (reason: string) => {
   app.set("shuttingDown", true);
   clearDrainTimers();
 
-  const parsedTimeout = parseInt(process.env.SHUTDOWN_TIMEOUT_SECS ?? "", 10);
-  const timeoutSecs =
-    Number.isInteger(parsedTimeout) && parsedTimeout >= 0
-      ? parsedTimeout
-      : DEFAULT_SHUTDOWN_TIMEOUT_SECS;
+  const timeoutSecs = shutdownTimeoutSecs;
   console.log(
     `${reason}, shutting down (waiting up to ${timeoutSecs}s for pending calls)`,
   );
@@ -111,7 +138,6 @@ const drain = () => {
   drainCheckTimer.unref();
   if (pending === 0) return shutdown("Drain complete");
 
-  const drainTimeoutSecs = parseInt(process.env.DRAIN_TIMEOUT_SECS ?? "", 10);
   if (drainTimeoutSecs > 0) {
     drainTimeoutTimer = setTimeout(() => {
       shutdown(`Drain timeout reached (${countPending()} still pending)`);

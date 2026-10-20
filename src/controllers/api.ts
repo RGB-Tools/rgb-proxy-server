@@ -17,6 +17,7 @@ import multer, { MulterError, StorageEngine } from "multer";
 import { homedir } from "os";
 import path from "path";
 
+import { parseNonNegativeInt, parsePositiveInt } from "../config";
 import {
   AlreadyAcked,
   CannotChange,
@@ -37,7 +38,8 @@ import {
   OperationNotFound,
   ServerDraining,
   SignedTxTooLarge,
-  TooManyTransfers,
+  TooManyItems,
+  TooManyMedia,
   TransferDataRetrieved,
   TransferIdDeleted,
   TransferIdInUse,
@@ -62,6 +64,12 @@ const DEFAULT_MAX_EXPIRY_SECS = 2592000;
 // Measured as the length of the base64 signed_tx string
 const DEFAULT_MAX_SIGNED_TX_SIZE = 153600; // 150 KiB
 const DEFAULT_MAX_TRANSFERS = 1000;
+// Default max number of media a transfer can have
+const DEFAULT_MAX_MEDIA = 21;
+// Temp files not modified for this long are removed by the GC: the file of an
+// upload being received is modified as its bytes arrive, and requests are
+// aborted by the HTTP server long before that
+const TMP_MAX_AGE_SECS = 3600;
 const DEFAULT_MAX_UPLOAD_BYTES = 104857600; // 100 MiB
 // Default max number of transfers an invoice can be reserved for
 const DEFAULT_MAX_QUOTA = 100;
@@ -80,18 +88,34 @@ const DEFAULT_POW_HOLD_SECS = 600; // 10 minutes
 const POW_DIFFICULTY_LIMIT = 256;
 // Max allowed distance from the proxy clock of timestamp and pow_timestamp
 const TIMESTAMP_TOLERANCE_SECS = 300;
-// Per-transfer allowance for the ack.prepare fields other than the signed TX
-const ACK_PREPARE_TRANSFER_OVERHEAD_BYTES = 1024;
-const JSON_BODY_BASE_BYTES = 102400; // 100 KiB
+// Allowance for the fields of a request other than its lists
+const REQUEST_BASE_BYTES = 4096;
+// Size of an ID in a JSON list: 64 hex characters, quotes and comma, with some
+// slack
+const JSON_ID_BYTES = 70;
+// Size of a transfer_data entry of ack.prepare (the transfer ID, the recipient
+// pubkey and the consignment hash with their keys), with some slack
+const TRANSFER_DATA_ENTRY_BYTES = 256;
+// Per-transfer allowance for the transfer ID key and the punctuation around
+// each signed TX in the file of ack.prepare
+const ACK_PREPARE_FILE_ENTRY_BYTES = 100;
 
 let maxExpirySecs: number;
 let maxSignedTxSize: number;
 let maxTransfers: number;
+let maxMedia: number;
 let maxUploadBytes: number;
+// Max size of the file of ack.prepare: the signed TXs of a whole operation
+let maxAckPrepareFileBytes: number;
 let maxQuota: number;
 let retentionGraceSecs: number;
 let proxyAuthPubkeys: string[] = [];
 let pow: ProofOfWork;
+
+// Max size of the file of a call, where only ack.prepare differs
+function uploadLimit(method: unknown): number {
+  return method === "ack.prepare" ? maxAckPrepareFileBytes : maxUploadBytes;
+}
 
 // file_size declared by the client, if the field was received before the file
 // part (multipart fields are only available in the order they are sent)
@@ -116,6 +140,24 @@ interface UploadedFile extends Express.Multer.File {
   blobHash: string;
 }
 
+// Write streams of the files being stored, so that they can be closed before
+// the files are removed
+const writeStreams = new WeakMap<Express.Multer.File, fs.WriteStream>();
+
+// Destroys the stream and then removes its file. A write stream creates its
+// file asynchronously, even if destroyed meanwhile: removing the file before
+// the stream is closed could leave it behind
+function removeStreamFile(
+  stream: fs.WriteStream,
+  filePath: string,
+  cb: (err: NodeJS.ErrnoException | null) => void,
+): void {
+  const unlink = () => fs.unlink(filePath, cb);
+  if (stream.closed) return unlink();
+  stream.once("close", unlink);
+  stream.destroy();
+}
+
 // Disk storage that hashes and counts the bytes as they are received and
 // aborts the upload as soon as the declared file_size is exceeded. The params
 // must precede the file, so that its declared size is known while it's
@@ -128,7 +170,10 @@ const storage: StorageEngine = {
       return cb(new Invalid(["file"]));
     }
     const declaredSize = getDeclaredFileSize(req);
-    if (declaredSize !== undefined && declaredSize > maxUploadBytes) {
+    if (
+      declaredSize !== undefined &&
+      declaredSize > uploadLimit(req.body?.method)
+    ) {
       file.stream.resume();
       return cb(new FileTooLarge());
     }
@@ -139,6 +184,10 @@ const storage: StorageEngine = {
     const filename = crypto.randomBytes(16).toString("hex");
     const finalPath = path.join(tempDir, filename);
     const outStream = fs.createWriteStream(finalPath);
+    writeStreams.set(file, outStream);
+    // multer removes the pending files of an interrupted upload (e.g. the
+    // client disconnecting) only if they have a path
+    file.path = finalPath;
     const hash = crypto.createHash("sha256");
     let received = 0;
     let aborted = false;
@@ -151,10 +200,14 @@ const storage: StorageEngine = {
       aborted = true;
       file.stream.unpipe(outStream);
       file.stream.resume();
-      outStream.destroy();
-      fs.unlink(finalPath, () => cb(new Invalid(["file_size"])));
+      removeStreamFile(outStream, finalPath, () =>
+        cb(new Invalid(["file_size"])),
+      );
     });
     file.stream.pipe(outStream);
+    // pipe() leaves the destination open when the source fails (e.g. the
+    // client disconnecting), which would leak its file descriptor
+    file.stream.on("error", () => outStream.destroy());
     outStream.on("error", (err) => {
       if (!aborted) cb(err);
     });
@@ -171,6 +224,8 @@ const storage: StorageEngine = {
   },
   _removeFile(_req, file, cb) {
     if (!file.path) return cb(null);
+    const stream = writeStreams.get(file);
+    if (stream) return removeStreamFile(stream, file.path, cb);
     fs.unlink(file.path, cb);
   },
 };
@@ -182,6 +237,9 @@ let db: Database;
 let gcTimer: NodeJS.Timeout | undefined;
 // Set when draining, see startDraining
 let draining = false;
+// Transient files of the uploads being received (one request each), never
+// needed once the server stops. Anything that must survive a restart (e.g.
+// resumable uploads) needs its own dir and DB records
 let tempDir: string;
 let consignmentDir: string;
 let mediaDir: string;
@@ -266,6 +324,7 @@ interface ServerInfo {
   max_file_size: string;
   max_signed_tx_size: string;
   max_transfers: string;
+  max_media: string;
 }
 
 type InvoiceStatus = "unknown" | "available" | "full";
@@ -436,22 +495,6 @@ export function deriveTransferId(invoiceId: string, senderPk: string): string {
   return hashUtf8Message(TRANSFER_ID_PREFIX + invoiceId + senderPk).toString(
     "hex",
   );
-}
-
-export function parsePositiveInt(
-  raw: string | undefined,
-  fallback: number,
-): number {
-  const parsed = parseInt(raw ?? "", 10);
-  return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
-}
-
-export function parseNonNegativeInt(
-  raw: string | undefined,
-  fallback: number,
-): number {
-  const parsed = parseInt(raw ?? "", 10);
-  return Number.isInteger(parsed) && parsed >= 0 ? parsed : fallback;
 }
 
 function nowSecs(): number {
@@ -639,9 +682,10 @@ class ParamReader {
     return ids;
   }
 
-  // Non-empty map from transfer ID to its ack.prepare data
-  transferData(): Record<string, TransferData> {
-    const result: Record<string, TransferData> = {};
+  // Non-empty map from transfer ID to its ack.prepare data, the signed TXs
+  // being in the file of the call
+  transferData(): Record<string, Omit<TransferData, "signed_tx">> {
+    const result: Record<string, Omit<TransferData, "signed_tx">> = {};
     const td = this.tryRead("transfer_data", isDictionary);
     if (td === undefined) return result;
     const entries = Object.entries(td);
@@ -656,7 +700,6 @@ class ParamReader {
       result[transferId] = {
         recipient_pk: fields.hex64("recipient_pk"),
         consignment_hash: fields.hex64("consignment_hash"),
-        signed_tx: fields.base64("signed_tx"),
       };
       fields.missing.forEach((f) => this.addMissing(f));
       fields.invalid.forEach((f) => this.addInvalid(f));
@@ -695,8 +738,9 @@ function checkProxyAuth(signature: string, message: string): void {
 function receivedUpload(
   file: UploadedFile | undefined,
   declaredSize: number,
+  limit = maxUploadBytes,
 ): UploadedFile {
-  if (declaredSize > maxUploadBytes) throw new FileTooLarge();
+  if (declaredSize > limit) throw new FileTooLarge();
   if (!file) throw new MissingFile();
   if (file.size !== declaredSize) throw new Invalid(["file_size"]);
   return file;
@@ -947,6 +991,7 @@ jsonRpcServer.addMethod(
       max_file_size: String(maxUploadBytes),
       max_signed_tx_size: String(maxSignedTxSize),
       max_transfers: String(maxTransfers),
+      max_media: String(maxMedia),
     };
   },
 );
@@ -1001,11 +1046,13 @@ jsonRpcServer.addMethod(
     const params = new ParamReader(jsonRpcParams);
     const invoiceIds = params.invoiceIds();
     params.check();
+    if (invoiceIds.length > maxTransfers) throw new TooManyItems();
 
     // Read-only: reading the difficulty doesn't count as a call
     const now = powNow();
     const result: Record<string, InvoiceCheckRes> = {};
-    for (const invoiceId of invoiceIds) {
+    // The cap counts the repeated IDs, but each one is looked up only once
+    for (const invoiceId of new Set(invoiceIds)) {
       result[invoiceId] = {
         status: getInvoiceStatus(invoiceId),
         pow_difficulty: String(pow.difficulty(invoiceId, now)),
@@ -1080,7 +1127,9 @@ jsonRpcServer.addMethod(
     if (deriveTransferId(invoiceId, senderPk) !== transferId) {
       throw new Invalid(["transfer_id"]);
     }
-    const message = hashUtf8Message(transferId + consignmentHash + blobHash);
+    const message = hashUtf8Message(
+      transferId + consignmentHash + blobHash + "consignment",
+    );
     if (!verifyEd25519(senderPk, signature, message)) {
       throw new InvalidEndpointAuthSignature();
     }
@@ -1173,13 +1222,20 @@ jsonRpcServer.addMethod(
       return false; // idempotent, also after transfer.retrieved
     }
 
-    const message = hashUtf8Message(transferId + mediaId + blobHash);
+    const message = hashUtf8Message(transferId + mediaId + blobHash + "media");
     if (!verifyEd25519(transfer.sender_pk, signature, message)) {
       throw new InvalidEndpointAuthSignature();
     }
     if (existing) throw new CannotChange(["file"]);
     // New media would never be retrievable
     if (transfer.status === "retrieved") throw new TransferDataRetrieved();
+    // Identical re-posts returned above, so only new media count
+    const { count } = db
+      .prepare(
+        "SELECT COUNT(*) AS count FROM transfer_media WHERE transfer_id = ?",
+      )
+      .get(transferId) as { count: number };
+    if (count >= maxMedia) throw new TooManyMedia();
 
     storeUpload(file, "transfer_media", () =>
       db
@@ -1295,28 +1351,60 @@ jsonRpcServer.addMethod(
   },
 );
 
+// Signed TXs of an ack.prepare call, read from its file (a JSON object from
+// transfer ID to base64 signed TX) which must have exactly the call's
+// transfers
+async function readSignedTxs(
+  file: UploadedFile,
+  transferIds: string[],
+): Promise<Record<string, string>> {
+  let signedTxs: unknown;
+  try {
+    signedTxs = JSON.parse(await fs.promises.readFile(file.path, "utf8"));
+  } catch {
+    throw new Invalid(["file"]);
+  }
+  if (!isDictionary(signedTxs)) throw new Invalid(["file"]);
+  if (transferIds.some((tid) => !(tid in signedTxs))) {
+    throw new Missing(["signed_tx"]);
+  }
+  const expected = new Set(transferIds);
+  const result: Record<string, string> = {};
+  for (const [tid, signedTx] of Object.entries(signedTxs)) {
+    if (!expected.has(tid) || !isBase64(signedTx)) {
+      throw new Invalid(["signed_tx"]);
+    }
+    if (signedTx.length > maxSignedTxSize) throw new SignedTxTooLarge();
+    result[tid] = signedTx;
+  }
+  return result;
+}
+
 // ack.prepare
 jsonRpcServer.addMethod(
   "ack.prepare",
-  async (jsonRpcParams, _serverParams): Promise<boolean> => {
+  async (jsonRpcParams, serverParams): Promise<boolean> => {
     const params = new ParamReader(jsonRpcParams);
-    const transferData = params.transferData();
+    const transferParams = params.transferData();
     const expiresAt = params.expiresAt();
     const signedTxHash = params.hex64("signed_tx_hash");
     const senderPk = params.hex64("sender_pk");
+    const fileSize = params.fileSize();
     const signature = params.proxyAuthSignature();
     params.check();
 
-    const transferIds = Object.keys(transferData).sort();
+    const transferIds = Object.keys(transferParams).sort();
     if (transferIds.length > maxTransfers) {
-      throw new TooManyTransfers();
+      throw new TooManyItems();
     }
-    for (const td of Object.values(transferData)) {
-      if (td.signed_tx.length > maxSignedTxSize) {
-        throw new SignedTxTooLarge();
-      }
-    }
+    const file = receivedUpload(
+      serverParams?.file,
+      fileSize,
+      maxAckPrepareFileBytes,
+    );
 
+    // Checked before reading the file, as the signature doesn't cover the
+    // signed TXs: a caller that isn't allowed doesn't make the proxy read them
     checkProxyAuth(
       signature,
       senderPk +
@@ -1324,11 +1412,17 @@ jsonRpcServer.addMethod(
         signedTxHash +
         transferIds
           .map((tid) => {
-            const td = transferData[tid];
+            const td = transferParams[tid];
             return tid + td.recipient_pk + td.consignment_hash;
           })
           .join(""),
     );
+
+    const signedTxs = await readSignedTxs(file, transferIds);
+    const transferData: Record<string, TransferData> = {};
+    for (const tid of transferIds) {
+      transferData[tid] = { ...transferParams[tid], signed_tx: signedTxs[tid] };
+    }
 
     return db.transaction((): boolean => {
       // Check existing registrations
@@ -1528,6 +1622,8 @@ jsonRpcServer.addMethod(
     const signature = params.hex128("signature");
     const timestamp = params.timestamp();
     params.check();
+    // An operation can't have more transfers, no need to look them up
+    if (transferIds.length > maxTransfers) throw new TooManyItems();
 
     const op = getAckOperation(transferIds);
 
@@ -1583,6 +1679,8 @@ jsonRpcServer.addMethod(
     const transferIds = params.transferIds().sort();
     const signature = params.hex128("signature");
     params.check();
+    // An operation can't have more transfers, no need to look them up
+    if (transferIds.length > maxTransfers) throw new TooManyItems();
 
     // The checks and the writes run in a single synchronous transaction, with
     // no await in between, so ack.clean and ack.post calls for the same
@@ -1651,6 +1749,7 @@ export function runGC(now = nowSecs()): void {
     deleteInvoiceData(invoice_id);
   }
   pow.prune(now);
+  cleanTempDir(TMP_MAX_AGE_SECS, now);
 
   // Sender proxy
   const expiredOps = db
@@ -1668,6 +1767,26 @@ export function runGC(now = nowSecs()): void {
       db.prepare("DELETE FROM ack_transfers WHERE operation_id = ?").run(id);
       db.prepare("DELETE FROM ack_operations WHERE id = ?").run(id);
     })();
+  }
+}
+
+// Removes the files of the temp dir not modified for more than maxAgeSecs (0:
+// all of them), i.e. the leftovers of interrupted uploads and crashes
+function cleanTempDir(maxAgeSecs: number, now = nowSecs()): void {
+  for (const name of fs.readdirSync(tempDir)) {
+    const file = path.join(tempDir, name);
+    try {
+      // now is in whole seconds: a file written earlier in the current one
+      // would look newer than it, so no age check when removing all
+      if (
+        maxAgeSecs === 0 ||
+        now - fs.statSync(file).mtimeMs / 1000 >= maxAgeSecs
+      ) {
+        fs.rmSync(file, { recursive: true, force: true });
+      }
+    } catch {
+      // Gone meanwhile
+    }
   }
 }
 
@@ -1717,9 +1836,7 @@ export function countPending(now = nowSecs()): number {
 export const loadApiEndpoints = (app: Application): void => {
   // Checked first, as a misconfigured pubkey would make every authenticated
   // call fail
-  const pubkeys = parseProxyAuthPubkeys(
-    process.env.PROXY_AUTH_PUBKEYS ?? process.env.PROXY_AUTH_PUBKEY,
-  );
+  const pubkeys = parseProxyAuthPubkeys(process.env.PROXY_AUTH_PUBKEYS);
   const invalidPubkeys = pubkeys.filter((pk) => !isHex64(pk));
   if (invalidPubkeys.length > 0) {
     throw new Error(
@@ -1729,74 +1846,73 @@ export const loadApiEndpoints = (app: Application): void => {
   }
   proxyAuthPubkeys = pubkeys;
 
+  // Numeric settings, refused if invalid before anything is created
+  maxExpirySecs = parsePositiveInt("MAX_EXPIRY_SECS", DEFAULT_MAX_EXPIRY_SECS);
+  maxSignedTxSize = parsePositiveInt(
+    "MAX_SIGNED_TX_SIZE",
+    DEFAULT_MAX_SIGNED_TX_SIZE,
+  );
+  maxTransfers = parsePositiveInt("MAX_TRANSFERS", DEFAULT_MAX_TRANSFERS);
+  maxMedia = parsePositiveInt("MAX_MEDIA", DEFAULT_MAX_MEDIA);
+  maxUploadBytes = parsePositiveInt(
+    "MAX_UPLOAD_BYTES",
+    DEFAULT_MAX_UPLOAD_BYTES,
+  );
+  maxQuota = parsePositiveInt("MAX_QUOTA", DEFAULT_MAX_QUOTA);
+  maxAckPrepareFileBytes =
+    REQUEST_BASE_BYTES +
+    maxTransfers * (maxSignedTxSize + ACK_PREPARE_FILE_ENTRY_BYTES);
+  retentionGraceSecs = parseNonNegativeInt(
+    "RETENTION_GRACE_SECS",
+    DEFAULT_RETENTION_GRACE_SECS,
+  );
+
+  pow = new ProofOfWork({
+    maxDifficulty: parseNonNegativeInt(
+      "MAX_POW_DIFFICULTY",
+      DEFAULT_MAX_POW_DIFFICULTY,
+      POW_DIFFICULTY_LIMIT,
+    ),
+    rateThreshold: parsePositiveInt(
+      "POW_RATE_THRESHOLD",
+      DEFAULT_POW_RATE_THRESHOLD,
+    ),
+    rateStep: parsePositiveInt("POW_RATE_STEP", DEFAULT_POW_RATE_STEP),
+    globalThreshold: parsePositiveInt(
+      "POW_GLOBAL_THRESHOLD",
+      DEFAULT_POW_GLOBAL_THRESHOLD,
+    ),
+    globalStep: parsePositiveInt("POW_GLOBAL_STEP", DEFAULT_POW_GLOBAL_STEP),
+    windowSecs: parsePositiveInt("POW_WINDOW_SECS", DEFAULT_POW_WINDOW_SECS),
+    holdSecs: parseNonNegativeInt("POW_HOLD_SECS", DEFAULT_POW_HOLD_SECS),
+  });
+
   appDir = process.env.APP_DATA || path.join(homedir(), DEFAULT_APP_DATA);
+  // Not to be shared with another running instance, see cleanTempDir
   setDir(appDir);
   tempDir = path.join(appDir, "tmp");
   consignmentDir = path.join(appDir, "consignments");
   mediaDir = path.join(appDir, "media");
   setDir(tempDir);
+  // Nothing is in flight yet: whatever is left was interrupted by a crash
+  cleanTempDir(0);
   setDir(consignmentDir);
   setDir(mediaDir);
 
-  maxExpirySecs = parsePositiveInt(
-    process.env.MAX_EXPIRY_SECS,
-    DEFAULT_MAX_EXPIRY_SECS,
-  );
-  maxSignedTxSize = parsePositiveInt(
-    process.env.MAX_SIGNED_TX_SIZE,
-    DEFAULT_MAX_SIGNED_TX_SIZE,
-  );
-  maxTransfers = parsePositiveInt(
-    process.env.MAX_TRANSFERS,
-    DEFAULT_MAX_TRANSFERS,
-  );
-  maxUploadBytes = parsePositiveInt(
-    process.env.MAX_UPLOAD_BYTES,
-    DEFAULT_MAX_UPLOAD_BYTES,
-  );
-  maxQuota = parsePositiveInt(process.env.MAX_QUOTA, DEFAULT_MAX_QUOTA);
-  retentionGraceSecs = parseNonNegativeInt(
-    process.env.RETENTION_GRACE_SECS,
-    DEFAULT_RETENTION_GRACE_SECS,
-  );
-
-  pow = new ProofOfWork({
-    maxDifficulty: Math.min(
-      POW_DIFFICULTY_LIMIT,
-      parseNonNegativeInt(
-        process.env.MAX_POW_DIFFICULTY,
-        DEFAULT_MAX_POW_DIFFICULTY,
-      ),
-    ),
-    rateThreshold: parsePositiveInt(
-      process.env.POW_RATE_THRESHOLD,
-      DEFAULT_POW_RATE_THRESHOLD,
-    ),
-    rateStep: parsePositiveInt(
-      process.env.POW_RATE_STEP,
-      DEFAULT_POW_RATE_STEP,
-    ),
-    globalThreshold: parsePositiveInt(
-      process.env.POW_GLOBAL_THRESHOLD,
-      DEFAULT_POW_GLOBAL_THRESHOLD,
-    ),
-    globalStep: parsePositiveInt(
-      process.env.POW_GLOBAL_STEP,
-      DEFAULT_POW_GLOBAL_STEP,
-    ),
-    windowSecs: parsePositiveInt(
-      process.env.POW_WINDOW_SECS,
-      DEFAULT_POW_WINDOW_SECS,
-    ),
-    holdSecs: parseNonNegativeInt(
-      process.env.POW_HOLD_SECS,
-      DEFAULT_POW_HOLD_SECS,
-    ),
-  });
-
   upload = multer({
     storage,
-    limits: { fileSize: maxUploadBytes },
+    // busboy emits its limit event on reaching the limit, so the max allowed
+    // size needs a limit one above it. It is only a backstop for a client
+    // sending more than it declared, as the declared size is checked first
+    limits: {
+      fileSize: Math.max(maxUploadBytes, maxAckPrepareFileBytes) + 1,
+      files: 1,
+      // The params are sent either as one JSON field or as a field per value
+      // (two per ack.prepare transfer), next to the call's own fields
+      fields: 2 * maxTransfers + 64,
+      parts: 2 * maxTransfers + 65,
+      fieldSize: REQUEST_BASE_BYTES + maxTransfers * TRANSFER_DATA_ENTRY_BYTES,
+    },
   });
 
   db = new DatabaseConstructor(path.join(appDir, DATABASE_FILE), {});
@@ -1830,6 +1946,24 @@ export const loadApiEndpoints = (app: Application): void => {
   db.prepare(
     "CREATE INDEX IF NOT EXISTS transfers_invoice_id ON transfers(invoice_id)",
   ).run();
+  // Only the pending transfers, for their count (see countPending) without
+  // scanning all the transfers, and for their count per invoice in the GC.
+  // Keyed by invoice, as a status-only key would make the latter scan the
+  // pending transfers of every invoice
+  db.prepare(
+    `CREATE INDEX IF NOT EXISTS transfers_pending ON transfers(invoice_id)
+     WHERE status = 'pending'`,
+  ).run();
+  // For unlinkIfUnreferenced. Only the rows still referencing a file: the
+  // filename is cleared once the transfer is retrieved or deleted
+  db.prepare(
+    `CREATE INDEX IF NOT EXISTS transfers_filename ON transfers(filename)
+     WHERE filename IS NOT NULL`,
+  ).run();
+  // For the GC, which selects the expired invoices
+  db.prepare(
+    "CREATE INDEX IF NOT EXISTS invoices_expiration ON invoices(expiration)",
+  ).run();
 
   db.prepare(
     `CREATE TABLE IF NOT EXISTS transfer_media (
@@ -1841,6 +1975,12 @@ export const loadApiEndpoints = (app: Application): void => {
      )`,
   ).run();
 
+  // See transfers_filename
+  db.prepare(
+    `CREATE INDEX IF NOT EXISTS transfer_media_filename
+     ON transfer_media(filename) WHERE filename IS NOT NULL`,
+  ).run();
+
   // Sender proxy tables
   db.prepare(
     `CREATE TABLE IF NOT EXISTS ack_operations (
@@ -1849,6 +1989,11 @@ export const loadApiEndpoints = (app: Application): void => {
        signed_tx_hash TEXT NOT NULL,
        sender_pk      TEXT NOT NULL
      )`,
+  ).run();
+  // For the GC, which selects the expired operations
+  db.prepare(
+    `CREATE INDEX IF NOT EXISTS ack_operations_expiration
+     ON ack_operations(expiration)`,
   ).run();
 
   db.prepare(
@@ -1863,6 +2008,12 @@ export const loadApiEndpoints = (app: Application): void => {
        fetched          INTEGER NOT NULL DEFAULT 0
      )`,
   ).run();
+  // Every operation-level query (ackStats, dropSignedTxs, ack.get, GC) filters
+  // by operation, without it each of them scans the whole table
+  db.prepare(
+    `CREATE INDEX IF NOT EXISTS ack_transfers_operation_id
+     ON ack_transfers(operation_id)`,
+  ).run();
 
   // Run GC immediately on startup to clear any data that expired while the
   // server was down, then keep running it every 60 seconds.
@@ -1873,12 +2024,10 @@ export const loadApiEndpoints = (app: Application): void => {
   gcTimer = setInterval(runGC, 60_000);
   gcTimer.unref();
 
-  // The largest legitimate JSON body is an ack.prepare call carrying
-  // maxTransfers signed TXs of maxSignedTxSize each; bigger bodies are aborted
+  // The largest legitimate JSON body is a call listing maxTransfers IDs
+  // (ack.prepare carries its signed TXs in a file); bigger bodies are aborted
   // while being received
-  const maxJsonBodyBytes =
-    JSON_BODY_BASE_BYTES +
-    maxTransfers * (maxSignedTxSize + ACK_PREPARE_TRANSFER_OVERHEAD_BYTES);
+  const maxJsonBodyBytes = REQUEST_BASE_BYTES + maxTransfers * JSON_ID_BYTES;
 
   // Report uploads refused while being received (e.g. due to their size) as
   // JSON-RPC errors
@@ -1936,14 +2085,8 @@ export const loadApiEndpoints = (app: Application): void => {
       if (isDictionary(err) && err.type === "entity.parse.failed") {
         return sendResponse(res, parseErrorResponse());
       }
-      // Only an ack.prepare call carrying too big signed TXs can legitimately
-      // exceed the body limit
       if (isDictionary(err) && err.type === "entity.too.large") {
-        const error = new SignedTxTooLarge();
-        return sendResponse(
-          res,
-          createJSONRPCErrorResponse(null, error.code, error.message),
-        );
+        return sendResponse(res, invalidRequestResponse());
       }
       logger.error(`Unexpected error: ${err}`);
       sendResponse(res, internalErrorResponse());
@@ -1967,6 +2110,14 @@ function parseErrorResponse(): JSONRPCErrorResponse {
   );
 }
 
+function invalidRequestResponse(): JSONRPCErrorResponse {
+  return createJSONRPCErrorResponse(
+    null,
+    JSONRPCErrorCode.InvalidRequest,
+    "Invalid Request",
+  );
+}
+
 function internalErrorResponse(): JSONRPCErrorResponse {
   return createJSONRPCErrorResponse(
     null,
@@ -1980,19 +2131,13 @@ function internalErrorResponse(): JSONRPCErrorResponse {
 async function handleRequest(
   req: Request,
   file: UploadedFile | undefined,
-): Promise<JSONRPCResponse | JSONRPCResponse[] | null> {
+): Promise<JSONRPCResponse | null> {
   const body: unknown = req.body;
-  if (isArray(body)) {
-    logger.info("", { req });
-    return jsonRpcServer.receive(body as JSONRPCRequest[], { file });
-  }
+  // Batches are not supported: they would multiply the cost of a request
+  // beyond what the per-call limits allow
   if (!isDictionary(body)) {
     logger.info("", { req });
-    return createJSONRPCErrorResponse(
-      null,
-      JSONRPCErrorCode.InvalidRequest,
-      "Invalid Request",
-    );
+    return invalidRequestResponse();
   }
   httpContext.set("apiMethod", body.method);
   httpContext.set("clientID", body.id);
@@ -2012,10 +2157,7 @@ async function handleRequest(
 }
 
 // Sends the response, setting its summary for the logs
-function sendResponse(
-  res: Response,
-  response: JSONRPCResponse | JSONRPCResponse[] | null,
-): void {
+function sendResponse(res: Response, response: JSONRPCResponse | null): void {
   if (!response) {
     res.sendStatus(204);
     return;
@@ -2024,10 +2166,7 @@ function sendResponse(
   res.json(response);
 }
 
-function describeResponse(
-  response: JSONRPCResponse | JSONRPCResponse[],
-): string {
-  if (isArray(response)) return `batch of ${response.length}`;
+function describeResponse(response: JSONRPCResponse): string {
   if (isErrorResponse(response)) {
     return (
       `err <code: ${response.error.code}, ` +

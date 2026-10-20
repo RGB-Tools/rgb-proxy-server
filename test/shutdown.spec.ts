@@ -184,7 +184,7 @@ describe("SIGUSR2 (drain mode)", () => {
     expect(await server.waitForOutput("draining (2 pending)")).toBe(true);
     server.signal("SIGUSR2");
     expect(await server.waitForOutput("already draining")).toBe(true);
-    const refused = await client.rpc("ack.prepare", ackOperation().params);
+    const refused = await client.ackPrepareOp(ackOperation());
     expect(refused.body.error.code).toBe(draining);
 
     // The recipient acts on the transfer and on the operation...
@@ -215,6 +215,18 @@ describe("SIGUSR2 (drain mode)", () => {
     expect(server.output()).toContain(
       "Drain timeout reached (1 still pending)",
     );
+  });
+
+  it("keeps waiting with the largest DRAIN_TIMEOUT_SECS", async () => {
+    // A bigger value would fire the timer right away, see MAX_TIMEOUT_SECS
+    const server = await startServer({ DRAIN_TIMEOUT_SECS: "2147483" });
+    await postPendingTransfer(server);
+
+    server.signal("SIGUSR2");
+    expect(await server.waitForOutput("draining (1 pending)")).toBe(true);
+    await sleep(500);
+    expect(server.exit()).toBeUndefined();
+    expect(server.output()).not.toContain("Drain timeout reached");
   });
 
   it("is turned into a graceful shutdown by SIGTERM", async () => {

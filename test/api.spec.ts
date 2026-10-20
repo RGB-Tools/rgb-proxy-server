@@ -1,5 +1,7 @@
+import DatabaseConstructor from "better-sqlite3";
 import crypto from "crypto";
 import fs from "fs";
+import http from "http";
 import path from "path";
 import request from "supertest";
 
@@ -22,14 +24,17 @@ import {
   b64,
   futureExpiresAt,
   generateKeypair,
+  hasProcFds,
   invoiceIdOf,
   newTransfer,
   nowSecs,
+  openFilesUnder,
   randomId,
   sha256hex,
   sign,
   sleep,
   startApiApp,
+  waitFor,
 } from "./helpers";
 
 const jsonrpcVersion = "2.0";
@@ -44,11 +49,13 @@ const senderEndpoint = "rpc://sender.example.com/json-rpc";
 const retentionGraceSecs = 3600;
 const maxQuota = 5;
 const maxTransfers = 5;
+const maxMedia = 3;
 const { tempDir, appData } = startApiApp("temp-", {
   MAX_UPLOAD_BYTES: String(1024 * 1024),
   RETENTION_GRACE_SECS: String(retentionGraceSecs),
   MAX_QUOTA: String(maxQuota),
   MAX_TRANSFERS: String(maxTransfers),
+  MAX_MEDIA: String(maxMedia),
   // The proof of work stays disabled in this suite (difficulty 0) as the
   // thresholds are never reached, see pow-http.spec.ts for the proof of work
   POW_RATE_THRESHOLD: "1000000",
@@ -65,6 +72,8 @@ const {
   transferList,
   transferAction,
   invoiceStatus,
+  ackPrepareRaw,
+  ackPrepareOp,
   ackPrepare,
   ackGet,
   ackClean,
@@ -190,8 +199,11 @@ describe("server.info", () => {
     expect(res.body.result.max_file_size).toBe(String(1024 * 1024));
     expect(res.body.result.max_signed_tx_size).toBe("153600");
     expect(res.body.result.max_transfers).toBe(String(maxTransfers));
+    expect(res.body.result.max_media).toBe(String(maxMedia));
   });
 });
+
+const itIfProcFds = hasProcFds ? it : it.skip;
 
 describe("parameter validation", () => {
   it("expires_at in the past or beyond max_expiry_secs is invalid", async () => {
@@ -212,7 +224,10 @@ describe("parameter validation", () => {
       expect(res.body.error.data.fields).toEqual(["expires_at"]);
 
       const op = ackOperation();
-      res = await rpc("ack.prepare", { ...op.params, expires_at: expiresAt });
+      res = await ackPrepareRaw(
+        { ...op.params, expires_at: expiresAt },
+        op.signedTxs,
+      );
       expect(res.body.error.code).toBe(-200);
       expect(res.body.error.data.fields).toEqual(["expires_at"]);
     }
@@ -240,10 +255,10 @@ describe("parameter validation", () => {
     ]);
 
     // empty or repeated lists
-    res = await rpc("ack.prepare", {
-      ...ackOperation().params,
-      transfer_data: {},
-    });
+    res = await ackPrepareRaw(
+      { ...ackOperation().params, transfer_data: {} },
+      {},
+    );
     expect(res.body.error.code).toBe(-200);
     expect(res.body.error.data.fields).toEqual(["transfer_data"]);
     const tid = randomId();
@@ -256,39 +271,42 @@ describe("parameter validation", () => {
 
     // fields nested in transfer_data
     const recipient = generateKeypair();
-    res = await rpc("ack.prepare", {
-      transfer_data: {
-        [randomId()]: { recipient_pk: recipient.pubkeyHex },
-        [randomId()]: { consignment_hash: sha256hex("c") },
+    res = await ackPrepareRaw(
+      {
+        transfer_data: {
+          [randomId()]: { recipient_pk: recipient.pubkeyHex },
+          [randomId()]: { consignment_hash: sha256hex("c") },
+        },
+        expires_at: futureExpiresAt(),
+        signed_tx_hash: sha256hex("tx"),
       },
-      expires_at: futureExpiresAt(),
-      signed_tx_hash: sha256hex("tx"),
-    });
+      {},
+    );
     expect(res.body.error.code).toBe(-300);
     expect(res.body.error.data.fields).toEqual([
       "consignment_hash",
-      "signed_tx",
       "recipient_pk",
       "sender_pk",
     ]);
 
-    res = await rpc("ack.prepare", {
-      transfer_data: {
-        "not-a-transfer-id": {
-          recipient_pk: "nothex",
-          consignment_hash: sha256hex("c"),
-          signed_tx: "",
+    res = await ackPrepareRaw(
+      {
+        transfer_data: {
+          "not-a-transfer-id": {
+            recipient_pk: "nothex",
+            consignment_hash: sha256hex("c"),
+          },
         },
+        expires_at: "soon",
+        signed_tx_hash: sha256hex("tx"),
+        sender_pk: recipient.pubkeyHex,
       },
-      expires_at: "soon",
-      signed_tx_hash: sha256hex("tx"),
-      sender_pk: recipient.pubkeyHex,
-    });
+      {},
+    );
     expect(res.body.error.code).toBe(-200);
     expect(res.body.error.data.fields).toEqual([
       "transfer_id",
       "recipient_pk",
-      "signed_tx",
       "expires_at",
     ]);
 
@@ -349,6 +367,70 @@ describe("parameter validation", () => {
     expect(res.body.error.code).toBe(-300);
     expect(res.body.error.data.fields).toEqual(["file_size", "signature"]);
   });
+
+  // Linux only, as the descriptors are listed through /proc
+  itIfProcFds(
+    "releases the partial file and its descriptor of uploads interrupted by the client",
+    async () => {
+      const server = app.listen(0);
+      const tmp = path.join(appData, "tmp");
+      const port = (server.address() as { port: number }).port;
+      const boundary = "----interrupted";
+      const field = (name: string, value: string) =>
+        `--${boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${value}\r\n`;
+      try {
+        expect(fs.readdirSync(tmp)).toEqual([]);
+        expect(openFilesUnder(tmp)).toEqual([]);
+
+        const uploads = 20;
+        for (let i = 0; i < uploads; i++) {
+          const req = http.request({
+            port,
+            method: "POST",
+            path: "/json-rpc",
+            headers: {
+              "Content-Type": `multipart/form-data; boundary=${boundary}`,
+            },
+          });
+          req.on("error", () => {});
+          req.write(
+            field("jsonrpc", jsonrpcVersion) +
+              field("id", "1") +
+              field("method", "media.post") +
+              field("params[transfer_id]", randomId()) +
+              field("params[media_id]", randomId()) +
+              field("params[file_size]", "100000") +
+              field("params[signature]", "00".repeat(64)) +
+              `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="f"\r\n\r\n`,
+          );
+          req.write(Buffer.alloc(5000, 1));
+
+          // The upload is being stored (file created and held open), then the
+          // client disconnects mid-file. Counting the open descriptors as
+          // well ensures that the check below can see them
+          expect(
+            await waitFor(
+              () =>
+                fs.readdirSync(tmp).length === 1 &&
+                openFilesUnder(tmp).length > 0,
+              2000,
+            ),
+          ).toBe(true);
+          req.destroy();
+          await waitFor(() => fs.readdirSync(tmp).length === 0, 2000);
+        }
+
+        // The files are gone and, unlike what the directory listing shows, so
+        // are the descriptors: none leaked over the interruptions
+        await waitFor(() => openFilesUnder(tmp).length === 0, 2000);
+        expect(fs.readdirSync(tmp)).toEqual([]);
+        expect(openFilesUnder(tmp)).toEqual([]);
+      } finally {
+        server.closeAllConnections();
+        server.close();
+      }
+    },
+  );
 
   it("uploads without a file are refused", async () => {
     const res = await request(app)
@@ -466,6 +548,35 @@ describe("parameter validation", () => {
       filePath,
     );
     expect(res.body.error.code).toBe(-108);
+    expect(fs.readdirSync(path.join(appData, "tmp"))).toEqual([]);
+  });
+
+  it("accepts uploads of exactly the max upload size, not more", async () => {
+    const max = 1024 * 1024;
+    const invoice = await prepareInvoice("2");
+    const t = newTransfer(invoice.invoiceId);
+
+    // A consignment and a media of exactly the max are stored
+    let res = await postConsignment(t, "a".repeat(max));
+    expect(res.body.result).toBe(true);
+    res = await postMedia(t, randomId(), "b".repeat(max));
+    expect(res.body.result).toBe(true);
+
+    // One byte more is refused, as declared...
+    res = await postMedia(t, randomId(), "c".repeat(max + 1));
+    expect(res.body.error.code).toBe(-108);
+    // ...or as sent by a client declaring the max
+    res = await upload(
+      "media.post",
+      {
+        transfer_id: t.transferId,
+        media_id: randomId(),
+        file_size: String(max),
+        signature: "00".repeat(64),
+      },
+      "d".repeat(max + 1),
+    );
+    expect(res.body.error).toBeDefined();
     expect(fs.readdirSync(path.join(appData, "tmp"))).toEqual([]);
   });
 
@@ -600,6 +711,45 @@ describe("invoice.check", () => {
     });
   });
 
+  it("looks up each repeated invoice ID once", async () => {
+    const invoice = await prepareInvoice();
+    const unknownId = randomId();
+
+    const res = await rpc("invoice.check", {
+      invoice_ids: [
+        invoice.invoiceId,
+        unknownId,
+        invoice.invoiceId,
+        invoice.invoiceId,
+      ],
+    });
+    expect(res.body.result).toEqual({
+      [invoice.invoiceId]: { status: "available", pow_difficulty: "0" },
+      [unknownId]: { status: "unknown", pow_difficulty: "0" },
+    });
+
+    // Every statement is prepared by a lookup: the repeats cost nothing
+    const prepare = jest.spyOn(DatabaseConstructor.prototype, "prepare");
+    try {
+      await rpc("invoice.check", { invoice_ids: [invoice.invoiceId] });
+      const once = prepare.mock.calls.length;
+      expect(once).toBeGreaterThan(0);
+      prepare.mockClear();
+      await rpc("invoice.check", {
+        invoice_ids: Array(maxTransfers).fill(invoice.invoiceId),
+      });
+      expect(prepare.mock.calls.length).toBe(once);
+    } finally {
+      prepare.mockRestore();
+    }
+
+    // The cap counts the repeated IDs
+    const tooMany = await rpc("invoice.check", {
+      invoice_ids: Array(maxTransfers + 1).fill(invoice.invoiceId),
+    });
+    expect(tooMany.body.error.code).toBe(-109);
+  });
+
   it("validates the invoice IDs", async () => {
     let res = await rpc("invoice.check", {});
     expect(res.body.error.code).toBe(-300);
@@ -672,7 +822,9 @@ describe("consignment.post / consignment.get", () => {
         file_size: String(content.length),
         signature: sign(
           t.sender.privateKey,
-          hashUtf8Message(t.transferId + consignmentHash + sha256hex(content)),
+          hashUtf8Message(
+            t.transferId + consignmentHash + sha256hex(content) + "consignment",
+          ),
         ),
         pow_timestamp: String(nowSecs()),
         pow_nonce: "0",
@@ -733,7 +885,9 @@ describe("consignment.post / consignment.get", () => {
       consignment_hash: consignmentHash,
       signature: sign(
         generateKeypair().privateKey,
-        hashUtf8Message(t.transferId + consignmentHash + sha256hex(content)),
+        hashUtf8Message(
+          t.transferId + consignmentHash + sha256hex(content) + "consignment",
+        ),
       ),
     });
     expect(res.body.error.code).toBe(-502);
@@ -744,7 +898,21 @@ describe("consignment.post / consignment.get", () => {
       consignment_hash: consignmentHash,
       signature: sign(
         t.sender.privateKey,
-        hashUtf8Message(t.transferId + consignmentHash + sha256hex("other")),
+        hashUtf8Message(
+          t.transferId + consignmentHash + sha256hex("other") + "consignment",
+        ),
+      ),
+    });
+    expect(res.body.error.code).toBe(-502);
+
+    // a media.post signature can't be replayed on consignment.post
+    res = await postConsignment(t, content, {
+      consignment_hash: consignmentHash,
+      signature: sign(
+        t.sender.privateKey,
+        hashUtf8Message(
+          t.transferId + consignmentHash + sha256hex(content) + "media",
+        ),
       ),
     });
     expect(res.body.error.code).toBe(-502);
@@ -899,6 +1067,34 @@ describe("media.post / media.get", () => {
     expect(res.body.error.message).toBe("Transfer not found");
   });
 
+  it("refuses new media beyond max_media, but not identical re-posts", async () => {
+    const invoice = await prepareInvoice("2");
+    const t = newTransfer(invoice.invoiceId);
+    await postConsignment(t, "capped consignment");
+    const mediaIds = Array.from({ length: maxMedia }, () => randomId());
+    for (const id of mediaIds) {
+      expect((await postMedia(t, id, `media ${id}`)).body.result).toBe(true);
+    }
+
+    let res = await postMedia(t, randomId(), "one too many");
+    expect(res.body.error.code).toBe(-116);
+    expect(res.body.error.message).toBe("Too many media");
+    // An identical re-post stores nothing, so it doesn't count
+    res = await postMedia(t, mediaIds[0], `media ${mediaIds[0]}`);
+    expect(res.body.result).toBe(false);
+    // A different file for an existing media is still a change, not a cap
+    res = await postMedia(t, mediaIds[0], "different");
+    expect(res.body.error.code).toBe(-100);
+    // The cap is per transfer
+    const other = newTransfer(invoice.invoiceId);
+    await postConsignment(other, "other consignment");
+    res = await postMedia(other, randomId(), "first media");
+    expect(res.body.result).toBe(true);
+    // The signature is checked first
+    res = await postMedia(t, randomId(), "bad signer", other.sender);
+    expect(res.body.error.code).toBe(-502);
+  });
+
   it("stores the media of a transfer, idempotently", async () => {
     const invoice = await prepareInvoice();
     const t = newTransfer(invoice.invoiceId);
@@ -912,6 +1108,25 @@ describe("media.post / media.get", () => {
     expect(res.body.result).toBe(false);
     res = await postMedia(t, otherMediaId, "other media");
     expect(res.body.result).toBe(true);
+
+    // a consignment.post signature can't be replayed on media.post
+    const replayId = randomId();
+    res = await upload(
+      "media.post",
+      {
+        transfer_id: t.transferId,
+        media_id: replayId,
+        file_size: String(Buffer.byteLength("replay")),
+        signature: sign(
+          t.sender.privateKey,
+          hashUtf8Message(
+            t.transferId + replayId + sha256hex("replay") + "consignment",
+          ),
+        ),
+      },
+      "replay",
+    );
+    expect(res.body.error.code).toBe(-502);
 
     res = await postMedia(t, mediaId, "different media");
     expect(res.body.error.code).toBe(-100);
@@ -1127,32 +1342,33 @@ describe("transfer.list / transfer.retrieved / transfer.delete", () => {
 describe("ack.prepare", () => {
   it("registers an operation and is idempotent", async () => {
     const op = ackOperation(2);
-    let res = await rpc("ack.prepare", op.params);
+    let res = await ackPrepareOp(op);
     expect(res.body.result).toBe(true);
-    res = await rpc("ack.prepare", op.params);
+    res = await ackPrepareOp(op);
     expect(res.body.result).toBe(false);
   });
 
   it("cannot change a registered operation", async () => {
     const op = await ackPrepare(2);
     const [t1, t2] = op.transfers;
-    const res = await rpc("ack.prepare", {
-      transfer_data: {
-        [t1.transferId]: {
-          recipient_pk: generateKeypair().pubkeyHex,
-          consignment_hash: t1.consignmentHash,
-          signed_tx: b64("other tx"),
+    const res = await ackPrepareRaw(
+      {
+        transfer_data: {
+          [t1.transferId]: {
+            recipient_pk: generateKeypair().pubkeyHex,
+            consignment_hash: t1.consignmentHash,
+          },
+          [t2.transferId]: {
+            recipient_pk: t2.recipient.pubkeyHex,
+            consignment_hash: sha256hex("other"),
+          },
         },
-        [t2.transferId]: {
-          recipient_pk: t2.recipient.pubkeyHex,
-          consignment_hash: sha256hex("other"),
-          signed_tx: t2.signedTx,
-        },
+        expires_at: futureExpiresAt(7200),
+        signed_tx_hash: sha256hex("other tx"),
+        sender_pk: generateKeypair().pubkeyHex,
       },
-      expires_at: futureExpiresAt(7200),
-      signed_tx_hash: sha256hex("other tx"),
-      sender_pk: generateKeypair().pubkeyHex,
-    });
+      { [t1.transferId]: b64("other tx"), [t2.transferId]: t2.signedTx },
+    );
     expect(res.body.error.code).toBe(-100);
     expect(res.body.error.data.fields.sort()).toEqual(
       [
@@ -1172,55 +1388,103 @@ describe("ack.prepare", () => {
     const transferData = op.params.transfer_data as Record<string, object>;
 
     // subset of the operation
-    let res = await rpc("ack.prepare", {
-      ...op.params,
-      transfer_data: { [t1.transferId]: transferData[t1.transferId] },
-    });
+    let res = await ackPrepareRaw(
+      {
+        ...op.params,
+        transfer_data: { [t1.transferId]: transferData[t1.transferId] },
+      },
+      { [t1.transferId]: t1.signedTx },
+    );
     expect(res.body.error.code).toBe(-102);
     expect(res.body.error.message).toBe("Transfer ID in use");
 
     // partial overlap with a new transfer
-    res = await rpc("ack.prepare", {
-      ...op.params,
-      transfer_data: {
-        ...transferData,
-        [randomId()]: transferData[t1.transferId],
+    const newTid = randomId();
+    res = await ackPrepareRaw(
+      {
+        ...op.params,
+        transfer_data: {
+          ...transferData,
+          [newTid]: transferData[t1.transferId],
+        },
       },
-    });
+      { ...op.signedTxs, [newTid]: t1.signedTx },
+    );
     expect(res.body.error.code).toBe(-102);
 
     // overlap across two operations
     const other = await ackPrepare();
     const otherTid = other.transfers[0].transferId;
-    res = await rpc("ack.prepare", {
-      ...op.params,
-      transfer_data: {
-        ...transferData,
-        [otherTid]: (other.params.transfer_data as Record<string, object>)[
-          otherTid
-        ],
+    res = await ackPrepareRaw(
+      {
+        ...op.params,
+        transfer_data: {
+          ...transferData,
+          [otherTid]: (other.params.transfer_data as Record<string, object>)[
+            otherTid
+          ],
+        },
       },
-    });
+      { ...op.signedTxs, ...other.signedTxs },
+    );
     expect(res.body.error.code).toBe(-102);
   });
 
   it("limits the number of transfers", async () => {
-    let res = await rpc("ack.prepare", ackOperation(maxTransfers).params);
+    let res = await ackPrepareOp(ackOperation(maxTransfers));
     expect(res.body.result).toBe(true);
-    res = await rpc("ack.prepare", ackOperation(maxTransfers + 1).params);
+    res = await ackPrepareOp(ackOperation(maxTransfers + 1));
     expect(res.body.error.code).toBe(-109);
-    expect(res.body.error.message).toBe("Too many transfers");
+    expect(res.body.error.message).toBe("Too many items");
+  });
+
+  it("limits the number of IDs in invoice.check, ack.get and ack.clean", async () => {
+    const ids = (n: number) => Array.from({ length: n }, () => randomId());
+    const tooMany = (res: {
+      body: { error: { code: number; message: string } };
+    }) => {
+      expect(res.body.error.code).toBe(-109);
+      expect(res.body.error.message).toBe("Too many items");
+    };
+
+    let res = await rpc("invoice.check", { invoice_ids: ids(maxTransfers) });
+    expect(res.body.result).toBeDefined();
+    tooMany(await rpc("invoice.check", { invoice_ids: ids(maxTransfers + 1) }));
+
+    // Refused before looking up the operation, which doesn't exist
+    const timestamp = String(nowSecs());
+    const signature = "00".repeat(64);
+    res = await rpc("ack.get", {
+      transfer_ids: ids(maxTransfers),
+      timestamp,
+      signature,
+    });
+    expect(res.body.error.code).toBe(-104);
+    tooMany(
+      await rpc("ack.get", {
+        transfer_ids: ids(maxTransfers + 1),
+        timestamp,
+        signature,
+      }),
+    );
+    res = await rpc("ack.clean", {
+      transfer_ids: ids(maxTransfers),
+      signature,
+    });
+    expect(res.body.error.code).toBe(-104);
+    tooMany(
+      await rpc("ack.clean", {
+        transfer_ids: ids(maxTransfers + 1),
+        signature,
+      }),
+    );
   });
 
   it("limits the length of the base64 signed TX", async () => {
     const prepare = (signedTx: string) => {
       const op = ackOperation();
-      const transferData = op.params.transfer_data as Record<
-        string,
-        Record<string, string>
-      >;
-      transferData[op.transfers[0].transferId].signed_tx = signedTx;
-      return rpc("ack.prepare", op.params);
+      op.signedTxs[op.transfers[0].transferId] = signedTx;
+      return ackPrepareOp(op);
     };
 
     // 115200 bytes encode to exactly 153600 base64 characters
@@ -1235,11 +1499,66 @@ describe("ack.prepare", () => {
     expect(res.body.error.data.fields).toEqual(["signed_tx"]);
   });
 
-  it("aborts a body bigger than max_transfers signed TXs", async () => {
-    // max_transfers (5) signed TXs of max_signed_tx_size (153600) each, plus
-    // the overhead, stay below 1 MiB
-    const res = await rpc("server.info", { padding: "a".repeat(1024 * 1024) });
-    expect(res.body.error.code).toBe(-110);
+  it("requires the file to have the signed TX of every transfer, and only those", async () => {
+    const op = ackOperation(2);
+    const [t1, t2] = op.transfers;
+    let res = await ackPrepareRaw(op.params, { [t1.transferId]: t1.signedTx });
+    expect(res.body.error.code).toBe(-300);
+    expect(res.body.error.data.fields).toEqual(["signed_tx"]);
+
+    res = await ackPrepareRaw(op.params, {
+      ...op.signedTxs,
+      [randomId()]: t2.signedTx,
+    });
+    expect(res.body.error.code).toBe(-200);
+    expect(res.body.error.data.fields).toEqual(["signed_tx"]);
+
+    for (const content of ["not JSON", "[]", "null"]) {
+      res = await ackPrepareRaw(op.params, content);
+      expect(res.body.error.code).toBe(-200);
+      expect(res.body.error.data.fields).toEqual(["file"]);
+    }
+    expect((await ackPrepareOp(op)).body.result).toBe(true);
+  });
+
+  it("refuses ack.prepare without a file", async () => {
+    const res = await rpc("ack.prepare", ackOperation().params);
+    expect(res.body.error.code).toBe(-300);
+    expect(res.body.error.data.fields).toEqual(["file_size"]);
+  });
+
+  it("limits the file to max_transfers signed TXs", async () => {
+    // max_transfers (5) signed TXs of max_signed_tx_size (153600) each fit,
+    // a bigger file is refused by its declared size
+    const op = ackOperation();
+    const res = await ackPrepareRaw(
+      { ...op.params, file_size: String(1024 * 1024) },
+      op.signedTxs,
+    );
+    expect(res.body.error.code).toBe(-108);
+  });
+
+  it("aborts a JSON body bigger than max_transfers IDs", async () => {
+    // max_transfers (5) IDs of 64 characters stay below 1 KiB
+    const res = await rpc("server.info", { padding: "a".repeat(8 * 1024) });
+    expect(res.body.error.code).toBe(-32600);
+    const ids = Array.from({ length: maxTransfers }, () => randomId());
+    expect(
+      (await rpc("invoice.check", { invoice_ids: ids })).body.result,
+    ).toBeDefined();
+  });
+
+  it("refuses batches", async () => {
+    const call = { jsonrpc: jsonrpcVersion, method: "server.info", params: {} };
+    const res = await request(app)
+      .post("/json-rpc")
+      .send([
+        { ...call, id: "1" },
+        { ...call, id: "2" },
+      ])
+      .expect(200);
+    expect(res.body.error.code).toBe(-32600);
+    expect(Array.isArray(res.body)).toBe(false);
   });
 });
 
@@ -1729,5 +2048,87 @@ describe("data retention", () => {
     runGC(graceEnd2 + 10);
     res = await ackGet(op2);
     expect(res.body.error.code).toBe(-104);
+  });
+});
+
+describe("database indexes", () => {
+  // The queries filtering by a column that is not the primary key of their
+  // table, which would otherwise scan it whole
+  const cases: [string, string, string][] = [
+    [
+      "ack_transfers_operation_id",
+      "ack_transfers",
+      `SELECT COUNT(*), SUM(CASE WHEN acked = 1 THEN 1 ELSE 0 END)
+       FROM ack_transfers WHERE operation_id = 1`,
+    ],
+    [
+      "ack_transfers_operation_id",
+      "ack_transfers",
+      `UPDATE ack_transfers SET signed_tx = NULL
+       WHERE operation_id = 1 AND signed_tx IS NOT NULL`,
+    ],
+    [
+      "ack_transfers_operation_id",
+      "ack_transfers",
+      "DELETE FROM ack_transfers WHERE operation_id = 1",
+    ],
+    [
+      "transfers_filename",
+      "transfers",
+      "SELECT COUNT(*) AS n FROM transfers WHERE filename = 'x'",
+    ],
+    [
+      "transfer_media_filename",
+      "transfer_media",
+      "SELECT COUNT(*) AS n FROM transfer_media WHERE filename = 'x'",
+    ],
+    [
+      "ack_operations_expiration",
+      "ack_operations",
+      "SELECT id, expiration FROM ack_operations WHERE expiration <= 1",
+    ],
+    [
+      "invoices_expiration",
+      "invoices",
+      "SELECT invoice_id, expiration FROM invoices WHERE expiration <= 1",
+    ],
+    [
+      "transfers_pending",
+      "transfers",
+      // Scans the partial index, which only holds the pending transfers
+      "SELECT COUNT(*) AS n FROM transfers WHERE status = 'pending'",
+    ],
+    [
+      "transfers_pending",
+      "transfers",
+      "SELECT COUNT(*) FROM transfers WHERE invoice_id = 'x' AND status = 'pending'",
+    ],
+    [
+      "transfers_invoice_id",
+      "transfers",
+      "SELECT transfer_id FROM transfers WHERE invoice_id = 'x' AND status != 'deleted'",
+    ],
+  ];
+
+  it.each(cases)("%s is used by %s queries", (index, table, query) => {
+    const db = new DatabaseConstructor(path.join(appData, "app.db"), {
+      readonly: true,
+    });
+    try {
+      const plan = (
+        db.prepare(`EXPLAIN QUERY PLAN ${query}`).all() as { detail: string }[]
+      ).map((r) => r.detail);
+      // A search by the index, not a scan, which would even use the index when
+      // it covers the wrong column (e.g. a partial index scanned as it is
+      // smaller than the table)
+      const scansIndex =
+        index === "transfers_pending" && !query.includes("invoice_id");
+      const kind = scansIndex ? "SCAN" : "SEARCH";
+      expect(plan.join("\n")).toMatch(
+        new RegExp(`${kind} ${table} USING (COVERING )?INDEX ${index}`),
+      );
+    } finally {
+      db.close();
+    }
   });
 });

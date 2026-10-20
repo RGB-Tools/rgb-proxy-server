@@ -23,6 +23,7 @@ startApiApp("temp-drain-", {
 
 const {
   rpc,
+  ackPrepareOp,
   prepareInvoice,
   postConsignment,
   postMedia,
@@ -110,7 +111,19 @@ describe("drain mode", () => {
       "new",
     );
     expect(newConsignment.body.error.code).toBe(draining);
-    const newOp = await rpc("ack.prepare", ackOperation().params);
+    // ...before the invoice and the signature are checked
+    const unreserved = await postConsignment(
+      newTransfer(randomId()),
+      "unreserved",
+    );
+    expect(unreserved.body.error.code).toBe(draining);
+    const badSignature = await postConsignment(
+      newTransfer(invoice.invoiceId),
+      "bad signature",
+      { signature: "00".repeat(64) },
+    );
+    expect(badSignature.body.error.code).toBe(draining);
+    const newOp = await ackPrepareOp(ackOperation());
     expect(newOp.body.error.code).toBe(draining);
 
     // ...while repeating accepted ones is still idempotent
@@ -120,7 +133,7 @@ describe("drain mode", () => {
     expect((await postConsignment(transfer, "pending")).body.result).toBe(
       false,
     );
-    expect((await rpc("ack.prepare", op.params)).body.result).toBe(false);
+    expect((await ackPrepareOp(op)).body.result).toBe(false);
 
     // Calls reading or completing pending transfers keep working
     expect((await rpc("server.info", {})).body.result).toBeDefined();

@@ -23,7 +23,7 @@ startApiApp("temp-proxy-auth-", {
   PROXY_AUTH_PUBKEYS: `${allowed.pubkeyHex}, ${otherAllowed.pubkeyHex}`,
 });
 
-const { rpc } = apiClient(appTransport(app));
+const { rpc, ackPrepareRaw } = apiClient(appTransport(app));
 
 function invoicePrepareParams(quota?: string) {
   const recipient = generateKeypair();
@@ -53,12 +53,13 @@ function ackPrepareParams() {
     consignmentHash: sha256hex(randomId()),
   }));
   const transferData: Record<string, object> = {};
+  const signedTxs: Record<string, string> = {};
   for (const t of transfers) {
     transferData[t.transferId] = {
       recipient_pk: t.recipientPk,
       consignment_hash: t.consignmentHash,
-      signed_tx: b64(randomId()),
     };
+    signedTxs[t.transferId] = b64(randomId());
   }
   // transfers sorted by transfer ID, regardless of their order in the request
   let message = sender.pubkeyHex + expiresAt + signedTxHash;
@@ -74,6 +75,7 @@ function ackPrepareParams() {
       signed_tx_hash: signedTxHash,
       sender_pk: sender.pubkeyHex,
     },
+    signedTxs,
     message: hashUtf8Message(message),
   };
 }
@@ -124,20 +126,29 @@ describe("proxy auth signature over HTTP", () => {
   });
 
   it("ack.prepare rejects a signature from a non-allowlisted key", async () => {
+    const { params, signedTxs, message } = ackPrepareParams();
+    const res = await ackPrepareRaw(
+      { ...params, signature: sign(generateKeypair().privateKey, message) },
+      signedTxs,
+    );
+    expect(res.body.error.code).toBe(-501);
+  });
+
+  it("ack.prepare checks the signature before reading the file", async () => {
     const { params, message } = ackPrepareParams();
-    const res = await rpc("ack.prepare", {
-      ...params,
-      signature: sign(generateKeypair().privateKey, message),
-    });
+    const res = await ackPrepareRaw(
+      { ...params, signature: sign(generateKeypair().privateKey, message) },
+      "not a JSON file",
+    );
     expect(res.body.error.code).toBe(-501);
   });
 
   it("ack.prepare accepts a signature from an allowlisted key", async () => {
-    const { params, message } = ackPrepareParams();
-    const res = await rpc("ack.prepare", {
-      ...params,
-      signature: sign(allowed.privateKey, message),
-    });
+    const { params, signedTxs, message } = ackPrepareParams();
+    const res = await ackPrepareRaw(
+      { ...params, signature: sign(allowed.privateKey, message) },
+      signedTxs,
+    );
     expect(res.body.result).toBe(true);
   });
 

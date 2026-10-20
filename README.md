@@ -106,6 +106,8 @@ private invoices.
   is kept for `RETENTION_GRACE_SECS` after the expiration, regardless of
   `ack.get` calls, so that the sender can retrieve the ACKs and recipients can
   still retrieve a released signed TX by posting their ACK again
+- the files of uploads that were interrupted (e.g. by a client disconnecting
+  or a crash) are removed at startup, or by the GC once older than one hour
 
 ## Running the app
 
@@ -138,9 +140,20 @@ The container runs as the `node` user (uid/gid `1000`), so `$HOME` is
 The mount path must be owned by uid/gid `1000`. To mount the volume elsewhere,
 set `APP_DATA` to its path inside the container.
 
+Protocol 1.0 is not compatible with 0.2: 0.2 clients cannot use a 1.0 proxy
+(their calls fail with `-300`), and a 1.0 proxy cannot use a 0.2 data
+directory, as it neither migrates nor removes its consignment and media tables
+and files. Deploy 1.0 as a new instance with a fresh, empty `APP_DATA` (i.e. a
+new volume), not on top of an existing one.
+
 ### Data
 
 Stored under `$HOME/.rgb-proxy-server` by default. Override with `APP_DATA`.
+
+Each instance needs its own data directory: it must not be shared with another
+running instance, as the startup removes the files of the uploads in progress
+(`tmp`), which would break the ones of any other instance using it. This
+includes an instance being drained (see below) while its replacement starts.
 
 ### Graceful shutdown and drain mode
 
@@ -168,58 +181,68 @@ to a graceful shutdown.
 
 ## Configuration
 
-Environment variables (see `.env-sample`):
+Environment variables (see `.env-sample`). The numeric ones must be plain
+decimal integers (no sign, unit, exponent or prefix like `1e9`, `30d`, `0x10`):
+the server refuses to start on an invalid value, naming the variable, instead of
+guessing. An unset or empty variable uses its default.
 
-| Variable                | Default               | Description                                                                                                                                                                                                   |
-| ----------------------- | --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `APP_DATA`              | `~/.rgb-proxy-server` | Data directory                                                                                                                                                                                                |
-| `MAX_EXPIRY_SECS`       | `2592000` (30 days)   | Max allowed `expires_at` offset                                                                                                                                                                               |
-| `MAX_QUOTA`             | `100`                 | Max number of transfers an invoice can be reserved for                                                                                                                                                        |
-| `MAX_UPLOAD_BYTES`      | `104857600` (100 MiB) | Max consignment/media upload size (`max_file_size`)                                                                                                                                                           |
-| `MAX_SIGNED_TX_SIZE`    | `153600` (150 KiB)    | Max per-transfer signed TX in `ack.prepare`, measured as the length of the base64 `signed_tx` string (`max_signed_tx_size`)                                                                                   |
-| `MAX_TRANSFERS`         | `1000`                | Max transfers per `ack.prepare` operation (`max_transfers`)                                                                                                                                                   |
-| `RETENTION_GRACE_SECS`  | `86400` (1 day)       | Time data is kept after its expiration (max for pending transfers, always for operation data: ACKs, signatures, released signed TXs)                                                                          |
-| `MAX_POW_DIFFICULTY`    | `24`                  | Max proof of work difficulty (leading zero bits) required on `consignment.post`, `0` disables the proof of work                                                                                               |
-| `POW_RATE_THRESHOLD`    | `10`                  | Recent `consignment.post` calls for an invoice at which its difficulty becomes 1                                                                                                                              |
-| `POW_RATE_STEP`         | `2`                   | Further recent calls for an invoice for each additional bit                                                                                                                                                   |
-| `POW_GLOBAL_THRESHOLD`  | `1000`                | Recent `consignment.post` calls across all invoices at which the difficulty of every invoice becomes 1                                                                                                        |
-| `POW_GLOBAL_STEP`       | `50`                  | Further recent calls across all invoices for each additional bit                                                                                                                                              |
-| `POW_WINDOW_SECS`       | `3600` (1 hour)       | Time constant of the decay of the call counts (calls are counted over about this window)                                                                                                                      |
-| `POW_HOLD_SECS`         | `600` (10 minutes)    | Min time a difficulty stays in effect before it can decrease                                                                                                                                                  |
-| `SHUTDOWN_TIMEOUT_SECS` | `300` (5 minutes)     | On SIGTERM/SIGINT the server stops accepting new connections and waits up to this long for pending calls before aborting them; the orchestrator grace period (e.g. `docker stop -t`) must be at least as long |
-| `DRAIN_TIMEOUT_SECS`    | _(none)_              | Max time a drain waits for pending transfers before shutting down anyway; unset waits indefinitely                                                                                                            |
-| `PROXY_AUTH_PUBKEYS`    | _(none)_              | Comma-separated Ed25519 pubkeys (hex); when set, `invoice.prepare` and `ack.prepare` require a valid signature                                                                                                |
+| Variable                | Default               | Description                                                                                                                                                                                                                   |
+| ----------------------- | --------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `PORT`                  | `3000`                | Port the server listens on (1-65535)                                                                                                                                                                                          |
+| `APP_DATA`              | `~/.rgb-proxy-server` | Data directory                                                                                                                                                                                                                |
+| `MAX_EXPIRY_SECS`       | `2592000` (30 days)   | Max allowed `expires_at` offset                                                                                                                                                                                               |
+| `MAX_QUOTA`             | `100`                 | Max number of transfers an invoice can be reserved for                                                                                                                                                                        |
+| `MAX_UPLOAD_BYTES`      | `104857600` (100 MiB) | Max consignment/media upload size (`max_file_size`)                                                                                                                                                                           |
+| `MAX_SIGNED_TX_SIZE`    | `153600` (150 KiB)    | Max per-transfer signed TX in `ack.prepare`, measured as the length of the base64 `signed_tx` string (`max_signed_tx_size`)                                                                                                   |
+| `MAX_TRANSFERS`         | `1000`                | Max transfers per `ack.prepare` operation, also bounding the IDs of `invoice.check`, `ack.get` and `ack.clean` (`max_transfers`)                                                                                              |
+| `MAX_MEDIA`             | `21`                  | Max media a transfer can have (`max_media`)                                                                                                                                                                                   |
+| `RETENTION_GRACE_SECS`  | `86400` (1 day)       | Time data is kept after its expiration (max for pending transfers, always for operation data: ACKs, signatures, released signed TXs)                                                                                          |
+| `MAX_POW_DIFFICULTY`    | `24`                  | Max proof of work difficulty (leading zero bits) required on `consignment.post`, `0` disables the proof of work, max `256`                                                                                                    |
+| `POW_RATE_THRESHOLD`    | `10`                  | Recent `consignment.post` calls for an invoice at which its difficulty becomes 1                                                                                                                                              |
+| `POW_RATE_STEP`         | `2`                   | Further recent calls for an invoice for each additional bit                                                                                                                                                                   |
+| `POW_GLOBAL_THRESHOLD`  | `1000`                | Recent `consignment.post` calls across all invoices at which the difficulty of every invoice becomes 1                                                                                                                        |
+| `POW_GLOBAL_STEP`       | `50`                  | Further recent calls across all invoices for each additional bit                                                                                                                                                              |
+| `POW_WINDOW_SECS`       | `3600` (1 hour)       | Time constant of the decay of the call counts (calls are counted over about this window)                                                                                                                                      |
+| `POW_HOLD_SECS`         | `600` (10 minutes)    | Min time a difficulty stays in effect before it can decrease                                                                                                                                                                  |
+| `SHUTDOWN_TIMEOUT_SECS` | `300` (5 minutes)     | On SIGTERM/SIGINT the server stops accepting new connections and waits up to this long for pending calls before aborting them (max `2147483`); the orchestrator grace period (e.g. `docker stop -t`) must be at least as long |
+| `DRAIN_TIMEOUT_SECS`    | _(none)_              | Max time a drain waits for pending transfers before shutting down anyway (max `2147483`); unset waits indefinitely                                                                                                            |
+| `PROXY_AUTH_PUBKEYS`    | _(none)_              | Comma- or whitespace-separated Ed25519 pubkeys (hex); when set, `invoice.prepare` and `ack.prepare` require a valid signature                                                                                                 |
 
 With the default proof of work settings, the difficulty of an invoice starts
-rising after about 10 transfers in an hour and reaches 24 bits at about 56,
-while the difficulty of all invoices starts rising after about 1000 transfers
-in an hour across the proxy and reaches 24 bits at about 2150.
+rising at a sustained rate of about 10 transfers per hour and reaches 24 bits
+at about 56 per hour, while the difficulty of all invoices starts rising at
+about 1000 transfers per hour across the proxy and reaches 24 bits at about
+2150 per hour. These are steady state values of the decayed count: the first
+hour of a rate rises less (e.g. 56 transfers spread over one hour give an
+invoice difficulty of 13, and 2150 give 8 across the proxy).
 
 ## API endpoints
 
-All methods are invoked via `POST /json-rpc` (JSON-RPC 2.0). File uploads
-(`consignment.post`, `media.post`) use `multipart/form-data` with a `file`
-field and the params either as `params[<name>]` fields or as a single
-JSON-encoded `params` field, which must precede the file. All numbers
-(timestamps, sizes, quotas, difficulties), except `uptime` in `server.info`,
-are carried as decimal strings.
+All methods are invoked via `POST /json-rpc` (JSON-RPC 2.0), one call per
+request: batches (arrays of calls) are refused with `-32600`, as are JSON
+bodies bigger than the lists of IDs a call can carry (`MAX_TRANSFERS`). File
+uploads (`consignment.post`, `media.post`, `ack.prepare`) use
+`multipart/form-data` with a `file` field and the params either as
+`params[<name>]` fields or as a single JSON-encoded `params` field, which must
+precede the file. All numbers (timestamps, sizes, quotas, difficulties), except
+`uptime` in `server.info`, are carried as decimal strings.
 
-| Method               | Caller → proxy        | Params → result                                                                                                                                                                                                       |
-| -------------------- | --------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `server.info`        | any → any             | → `protocol_version`, `version`, `uptime`, `current_time`, `max_expiry_secs`, `max_quota`, `max_pow_difficulty`, `retention_grace_secs`, `max_file_size`, `max_signed_tx_size`, `max_transfers`                       |
-| `invoice.prepare`    | recipient → recipient | `invoice_id`, `expires_at`, `recipient_pk`, `quota` (optional, default `1`), `signature` (proxy auth only) → `true` (reserved) / `false` (identical reservation)                                                      |
-| `invoice.check`      | sender → recipient    | `invoice_ids` → `{invoice_id: {status: "unknown" \| "available" \| "full", pow_difficulty}}`                                                                                                                          |
-| `consignment.post`   | sender → recipient    | `invoice_id`, `transfer_id`, `sender_transport_endpoint`, `sender_pk`, `consignment_hash`, `batch`, `file_size`, `signature`, `pow_timestamp`, `pow_nonce` + `file` → `true` (created) / `false` (identical transfer) |
-| `consignment.get`    | recipient → recipient | `transfer_id` → `consignment` (base64), `sender_transport_endpoint`, `sender_pk`, `consignment_hash`, `batch`                                                                                                         |
-| `media.post`         | sender → recipient    | `transfer_id`, `media_id`, `file_size`, `signature` + `file` → `true` (stored) / `false` (identical file)                                                                                                             |
-| `media.get`          | recipient → recipient | `transfer_id`, `media_id` → media (base64)                                                                                                                                                                            |
-| `transfer.list`      | recipient → recipient | `invoice_id`, `timestamp`, `signature` → `{transfer_id: "pending" \| "retrieved"}` (deleted transfers are not listed)                                                                                                 |
-| `transfer.retrieved` | recipient → recipient | `transfer_id`, `signature` → `true` (data deleted) / `false` (already retrieved or deleted)                                                                                                                           |
-| `transfer.delete`    | recipient → recipient | `transfer_id`, `signature` → `true` (deleted, quota slot freed) / `false` (already deleted)                                                                                                                           |
-| `ack.prepare`        | sender → sender       | `transfer_data` (`{transfer_id: {recipient_pk, consignment_hash, signed_tx}}`), `expires_at`, `signed_tx_hash`, `sender_pk`, `signature` (proxy auth only) → `true` (registered) / `false` (identical operation)      |
-| `ack.post`           | recipient → sender    | `transfer_id`, `ack` (bool), `signature` → `result`, `sender_pk` and `signed_tx_hash` (on ACK), `signed_tx` (once all the transfers of the operation have been ACKed), `expires_at` (operation expiration)            |
-| `ack.get`            | sender → sender       | `transfer_ids`, `timestamp`, `signature` → `acks` (`{transfer_id: bool}`), `signatures` (`{transfer_id: signature}`); transfers not responded to yet are left out; doesn't trigger data deletion                      |
-| `ack.clean`          | sender → sender       | `transfer_ids` (all the operation's), `signature` → `true` (signed TXs removed) / `false` (none left); refused once every transfer has been ACKed                                                                     |
+| Method               | Caller → proxy        | Params → result                                                                                                                                                                                                                                          |
+| -------------------- | --------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `server.info`        | any → any             | → `protocol_version`, `version`, `uptime`, `current_time`, `max_expiry_secs`, `max_quota`, `max_pow_difficulty`, `retention_grace_secs`, `max_file_size`, `max_signed_tx_size`, `max_transfers`, `max_media`                                             |
+| `invoice.prepare`    | recipient → recipient | `invoice_id`, `expires_at`, `recipient_pk`, `quota` (optional, default `1`), `signature` (proxy auth only) → `true` (reserved) / `false` (identical reservation)                                                                                         |
+| `invoice.check`      | sender → recipient    | `invoice_ids` → `{invoice_id: {status: "unknown" \| "available" \| "full", pow_difficulty}}`                                                                                                                                                             |
+| `consignment.post`   | sender → recipient    | `invoice_id`, `transfer_id`, `sender_transport_endpoint`, `sender_pk`, `consignment_hash`, `batch`, `file_size`, `signature`, `pow_timestamp`, `pow_nonce` + `file` → `true` (created) / `false` (identical transfer)                                    |
+| `consignment.get`    | recipient → recipient | `transfer_id` → `consignment` (base64), `sender_transport_endpoint`, `sender_pk`, `consignment_hash`, `batch`                                                                                                                                            |
+| `media.post`         | sender → recipient    | `transfer_id`, `media_id`, `file_size`, `signature` + `file` → `true` (stored) / `false` (identical file)                                                                                                                                                |
+| `media.get`          | recipient → recipient | `transfer_id`, `media_id` → media (base64)                                                                                                                                                                                                               |
+| `transfer.list`      | recipient → recipient | `invoice_id`, `timestamp`, `signature` → `{transfer_id: "pending" \| "retrieved"}` (deleted transfers are not listed)                                                                                                                                    |
+| `transfer.retrieved` | recipient → recipient | `transfer_id`, `signature` → `true` (data deleted) / `false` (already retrieved or deleted)                                                                                                                                                              |
+| `transfer.delete`    | recipient → recipient | `transfer_id`, `signature` → `true` (deleted, quota slot freed) / `false` (already deleted)                                                                                                                                                              |
+| `ack.prepare`        | sender → sender       | `transfer_data` (`{transfer_id: {recipient_pk, consignment_hash}}`), `expires_at`, `signed_tx_hash`, `sender_pk`, `file_size`, `signature` (proxy auth only) + `file` (`{transfer_id: signed_tx}`) → `true` (registered) / `false` (identical operation) |
+| `ack.post`           | recipient → sender    | `transfer_id`, `ack` (bool), `signature` → `result`, `sender_pk` and `signed_tx_hash` (on ACK), `signed_tx` (once all the transfers of the operation have been ACKed), `expires_at` (operation expiration)                                               |
+| `ack.get`            | sender → sender       | `transfer_ids`, `timestamp`, `signature` → `acks` (`{transfer_id: bool}`), `signatures` (`{transfer_id: signature}`); transfers not responded to yet are left out; doesn't trigger data deletion                                                         |
+| `ack.clean`          | sender → sender       | `transfer_ids` (all the operation's), `signature` → `true` (signed TXs removed) / `false` (none left); refused once every transfer has been ACKed                                                                                                        |
 
 Call `server.info` first to read `protocol_version`, `current_time` and the
 limits.
@@ -236,14 +259,15 @@ Errors are returned as `{"code": <code>, "message": "<message>", "data": ...}`.
 | `-104` | Operation not found             | `ack.post`, `ack.get`, `ack.clean`                                                                                                                                |
 | `-105` | Operation expired               | `ack.post`                                                                                                                                                        |
 | `-107` | Already acked                   | `ack.clean` once every transfer has been ACKed                                                                                                                    |
-| `-108` | File too large                  | upload whose `file_size` exceeds `MAX_UPLOAD_BYTES`                                                                                                               |
-| `-109` | Too many transfers              | `ack.prepare` with more than `MAX_TRANSFERS` transfers                                                                                                            |
-| `-110` | Signed TX too large             | `ack.prepare` with a `signed_tx` longer than `MAX_SIGNED_TX_SIZE`, or a too big body                                                                              |
+| `-108` | File too large                  | upload whose `file_size` exceeds `MAX_UPLOAD_BYTES` (`ack.prepare`: the size of `MAX_TRANSFERS` signed TXs)                                                       |
+| `-109` | Too many items                  | `ack.prepare` with more than `MAX_TRANSFERS` transfers, `invoice.check`, `ack.get` or `ack.clean` with more than `MAX_TRANSFERS` IDs                              |
+| `-110` | Signed TX too large             | `ack.prepare` with a signed TX longer than `MAX_SIGNED_TX_SIZE`                                                                                                   |
 | `-111` | Invoice expired                 | `consignment.post`                                                                                                                                                |
 | `-112` | Invoice quota exceeded          | `consignment.post`                                                                                                                                                |
 | `-113` | Transfer ID deleted             | `consignment.post` for a transfer deleted via `transfer.delete`                                                                                                   |
 | `-114` | Invalid proof of work           | `consignment.post`, `data.pow_difficulty` is the difficulty currently required                                                                                    |
 | `-115` | Server draining                 | `invoice.prepare`, `consignment.post`, `ack.prepare` for a new call while the server is draining (see drain mode)                                                 |
+| `-116` | Too many media                  | `media.post` of a new media for a transfer that already has `MAX_MEDIA` media                                                                                     |
 | `-200` | Invalid                         | `data.fields` lists the invalid fields (including an out of window `timestamp`, a `file_size` not matching the uploaded file and a `file` sent before the params) |
 | `-300` | Missing                         | `data.fields` lists the missing fields, reported before the invalid ones                                                                                          |
 | `-301` | Missing file                    | upload with no `file`                                                                                                                                             |
@@ -257,10 +281,10 @@ Errors are returned as `{"code": <code>, "message": "<message>", "data": ...}`.
 
 `consignment.post` processes a call in this order: missing and invalid
 parameters; identical re-post (returns `false`, ignoring the proof of work);
-invoice reserved, invoice not expired, transfer ID derivation (`invalid`
-`transfer_id`), signature, transfer ID not deleted, unchanged data of an
-existing transfer; invoice quota; proof of work (only if the difficulty is
-greater than 0).
+while draining, any other call fails with `-115`; invoice reserved, invoice not
+expired, transfer ID derivation (`invalid` `transfer_id`), signature, transfer
+ID not deleted, unchanged data of an existing transfer; invoice quota; proof of
+work (only if the difficulty is greater than 0).
 
 `transfer.list` reports "invoice not reserved" and `transfer.retrieved` /
 `transfer.delete` report "transfer not found" before verifying the signature.
@@ -273,8 +297,8 @@ bytes of the listed fields, concatenated in order with no separators.
 | Method               | Signer                                               | Message fields                                                                                                        |
 | -------------------- | ---------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
 | `invoice.prepare`    | proxy auth key (only if `PROXY_AUTH_PUBKEYS` is set) | `invoice_id`, `expires_at`, `recipient_pk`, `quota` (`1` if omitted)                                                  |
-| `consignment.post`   | sender (`sender_pk`)                                 | `transfer_id`, `consignment_hash`, `blob_hash`                                                                        |
-| `media.post`         | sender (`sender_pk` from `consignment.post`)         | `transfer_id`, `media_id`, `blob_hash`                                                                                |
+| `consignment.post`   | sender (`sender_pk`)                                 | `transfer_id`, `consignment_hash`, `blob_hash`, literal `consignment`                                                 |
+| `media.post`         | sender (`sender_pk` from `consignment.post`)         | `transfer_id`, `media_id`, `blob_hash`, literal `media`                                                               |
 | `transfer.list`      | recipient (`recipient_pk` from `invoice.prepare`)    | `invoice_id`, `timestamp`                                                                                             |
 | `transfer.retrieved` | recipient (`recipient_pk` from `invoice.prepare`)    | `transfer_id`, `retrieved`                                                                                            |
 | `transfer.delete`    | recipient (`recipient_pk` from `invoice.prepare`)    | `transfer_id`, `delete`                                                                                               |
@@ -285,7 +309,9 @@ bytes of the listed fields, concatenated in order with no separators.
 
 `blob_hash` is the hex-encoded SHA-256 of the uploaded file bytes (possibly
 encrypted), computed by the proxy, so the signature binds the exact uploaded
-file. `retrieved` and `delete` are literal strings.
+file. `consignment`, `media`, `retrieved` and `delete` are literal strings;
+the first two keep the `consignment.post` and `media.post` signatures distinct,
+as their messages have the same shape.
 
 Wherever multiple transfers are involved they are sorted lexicographically by
 transfer ID, regardless of their order in the request. For `ack.get` this
@@ -369,30 +395,34 @@ curl -X POST -H 'Content-Type: application/json' \
 
 ### Prepare the ACK data (sender → sender proxy)
 
+The signed TXs are sent in the `file`, a JSON object from transfer ID to
+base64 signed TX with exactly the transfers of `transfer_data`, whose
+`file_size` must be declared in the params (up to `MAX_TRANSFERS` signed TXs of
+`MAX_SIGNED_TX_SIZE`, regardless of `MAX_UPLOAD_BYTES`).
+
 ```sh
-curl -X POST -H 'Content-Type: application/json' \
-  -d '{
-    "jsonrpc": "2.0",
-    "id": "5",
-    "method": "ack.prepare",
-    "params": {
-      "transfer_data": {
-        "<64-hex-transfer-id>": {
-          "recipient_pk": "<64-hex-ed25519-pubkey>",
-          "consignment_hash": "<64-hex-sha256-of-plaintext>",
-          "signed_tx": "<base64-encrypted-signed-tx>"
-        }
-      },
-      "expires_at": "1782820543",
-      "signed_tx_hash": "<64-hex-sha256-of-signed-tx>",
-      "sender_pk": "<64-hex-ed25519-pubkey>"
-    }
+echo '{"<64-hex-transfer-id>": "<base64-encrypted-signed-tx>"}' > signed_txs.json
+
+curl -X POST \
+  -F 'jsonrpc=2.0' -F 'id="5"' -F 'method=ack.prepare' \
+  -F 'params={
+    "transfer_data": {
+      "<64-hex-transfer-id>": {
+        "recipient_pk": "<64-hex-ed25519-pubkey>",
+        "consignment_hash": "<64-hex-sha256-of-plaintext>"
+      }
+    },
+    "expires_at": "1782820543",
+    "signed_tx_hash": "<64-hex-sha256-of-signed-tx>",
+    "sender_pk": "<64-hex-ed25519-pubkey>",
+    "file_size": "'"$(wc -c < signed_txs.json)"'"
   }' \
+  -F 'file=@signed_txs.json' \
   localhost:3000/json-rpc
 ```
 
 When `PROXY_AUTH_PUBKEYS` is set, a `signature` by one of the proxy auth keys
-is also required.
+is also required. It is verified before the file is read.
 
 ### Post a signed ACK (recipient → sender proxy)
 
