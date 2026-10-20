@@ -1,70 +1,15 @@
-import crypto from "crypto";
-import fs from "fs";
-import path from "path";
-import request from "supertest";
-
 import app from "../src/app";
-import {
-  closeApiEndpoints,
-  deriveTransferId,
-  hashUtf8Message,
-  loadApiEndpoints,
-} from "../src/controllers/api";
 import { leadingZeroBits, powDigest } from "../src/pow";
-
-const jsonrpcVersion = "2.0";
-const okStatus = 200;
-
-// ---------------------------------------------------------------------------
-// Helpers
-//
-// Mirror api.spec.ts, duplicated to keep this file's proof of work setup
-// fully independent of the shared suite.
-// ---------------------------------------------------------------------------
-
-const SPKI_PREFIX = Buffer.from("302a300506032b6570032100", "hex");
-
-interface Keypair {
-  privateKey: crypto.KeyObject;
-  pubkeyHex: string;
-}
-
-function generateKeypair(): Keypair {
-  const { privateKey, publicKey } = crypto.generateKeyPairSync("ed25519");
-  const spkiDer = publicKey.export({ type: "spki", format: "der" }) as Buffer;
-  const pubkeyHex = spkiDer.slice(SPKI_PREFIX.length).toString("hex");
-  return { privateKey, pubkeyHex };
-}
-
-function sign(privateKey: crypto.KeyObject, message: Buffer): string {
-  return crypto.sign(null, message, privateKey).toString("hex");
-}
-
-function sha256hex(data: string): string {
-  return crypto.createHash("sha256").update(data).digest("hex");
-}
-
-function randomId(): string {
-  return crypto.randomBytes(32).toString("hex");
-}
-
-function nowSecs(): number {
-  return Math.floor(Date.now() / 1000);
-}
-
-async function rpc(method: string, params: object) {
-  return request(app)
-    .post("/json-rpc")
-    .send({ jsonrpc: jsonrpcVersion, id: "1", method, params })
-    .expect(okStatus);
-}
-
-// ---------------------------------------------------------------------------
-// Setup
-// ---------------------------------------------------------------------------
-
-const tempDir = fs.mkdtempSync(path.join(__dirname, "temp-pow-"));
-process.env.APP_DATA = path.join(tempDir, "app-data");
+import {
+  apiClient,
+  appTransport,
+  Invoice,
+  newTransfer,
+  nowSecs,
+  randomId,
+  startApiApp,
+  Transfer,
+} from "./helpers";
 
 // Small difficulties, so that proofs of work are cheap to compute. The decayed
 // call count is slightly lower than the number of calls, as some time passes
@@ -72,47 +17,17 @@ process.env.APP_DATA = path.join(tempDir, "app-data");
 // difficulty is 1 after the 3rd call and 2 after the 4th one. The global
 // difficulty is 1 after the 10th call across all invoices.
 const maxPowDifficulty = 6;
-process.env.MAX_POW_DIFFICULTY = String(maxPowDifficulty);
-process.env.POW_RATE_THRESHOLD = "2";
-process.env.POW_RATE_STEP = "1";
-process.env.POW_GLOBAL_THRESHOLD = "9";
-process.env.POW_GLOBAL_STEP = "1";
-process.env.MAX_QUOTA = "10";
-
-loadApiEndpoints(app);
-
-afterAll(() => {
-  closeApiEndpoints();
-  return fs.promises.rm(tempDir, { recursive: true, force: true });
+startApiApp("temp-pow-", {
+  MAX_POW_DIFFICULTY: String(maxPowDifficulty),
+  POW_RATE_THRESHOLD: "2",
+  POW_RATE_STEP: "1",
+  POW_GLOBAL_THRESHOLD: "9",
+  POW_GLOBAL_STEP: "1",
+  MAX_QUOTA: "10",
 });
 
-interface Transfer {
-  invoiceId: string;
-  transferId: string;
-  sender: Keypair;
-}
-
-async function prepareInvoice(quota: string) {
-  const recipient = generateKeypair();
-  const invoiceId = randomId();
-  const res = await rpc("invoice.prepare", {
-    invoice_id: invoiceId,
-    expires_at: String(nowSecs() + 3600),
-    recipient_pk: recipient.pubkeyHex,
-    quota,
-  });
-  expect(res.body.result).toBe(true);
-  return { invoiceId, recipient };
-}
-
-function newTransfer(invoiceId: string): Transfer {
-  const sender = generateKeypair();
-  return {
-    invoiceId,
-    transferId: deriveTransferId(invoiceId, sender.pubkeyHex),
-    sender,
-  };
-}
+const client = apiClient(appTransport(app));
+const { rpc, prepareInvoice, transferAction } = client;
 
 // First nonce whose puzzle hash has at least (or, if !valid, less than) the
 // given number of leading zero bits
@@ -130,39 +45,17 @@ function findNonce(
   }
 }
 
-async function postConsignment(
+// Posts a consignment with the given proof of work fields
+function postConsignment(
   t: Transfer,
   content: string,
   powTimestamp: string,
   powNonce: string,
 ) {
-  const consignmentHash = sha256hex("plaintext " + content);
-  return request(app)
-    .post("/json-rpc")
-    .set("Content-type", "multipart/form-data")
-    .field("jsonrpc", jsonrpcVersion)
-    .field("id", "1")
-    .field("method", "consignment.post")
-    .field(
-      "params",
-      JSON.stringify({
-        invoice_id: t.invoiceId,
-        transfer_id: t.transferId,
-        sender_transport_endpoint: "rpc://sender.example.com/json-rpc",
-        sender_pk: t.sender.pubkeyHex,
-        consignment_hash: consignmentHash,
-        batch: false,
-        file_size: String(Buffer.byteLength(content)),
-        signature: sign(
-          t.sender.privateKey,
-          hashUtf8Message(t.transferId + consignmentHash + sha256hex(content)),
-        ),
-        pow_timestamp: powTimestamp,
-        pow_nonce: powNonce,
-      }),
-    )
-    .attach("file", Buffer.from(content), "consignment")
-    .expect(okStatus);
+  return client.postConsignment(t, content, {
+    pow_timestamp: powTimestamp,
+    pow_nonce: powNonce,
+  });
 }
 
 // Posts with a valid proof of work for the given difficulty
@@ -193,7 +86,7 @@ describe("adaptive proof of work over HTTP", () => {
     expect(res.body.result.max_pow_difficulty).toBe(String(maxPowDifficulty));
   });
 
-  let invoice: { invoiceId: string; recipient: Keypair };
+  let invoice: Invoice;
   const transfers: Transfer[] = [];
 
   it("rises with the calls for an invoice and is verified", async () => {
@@ -264,13 +157,7 @@ describe("adaptive proof of work over HTTP", () => {
 
     // transfer ID deleted
     const deleted = transfers[0];
-    res = await rpc("transfer.delete", {
-      transfer_id: deleted.transferId,
-      signature: sign(
-        invoice.recipient.privateKey,
-        hashUtf8Message(deleted.transferId + "delete"),
-      ),
-    });
+    res = await transferAction("delete", deleted.transferId, invoice.recipient);
     expect(res.body.result).toBe(true);
     res = await postConsignment(deleted, "pow 1", "1", "any");
     expect(res.body.error.code).toBe(-113);

@@ -5,14 +5,32 @@ import request from "supertest";
 
 import app from "../src/app";
 import {
-  closeApiEndpoints,
   deriveTransferId,
   hashUtf8Message,
-  loadApiEndpoints,
   parseProxyAuthPubkeys,
   runGC,
   verifyAnyEd25519,
 } from "../src/controllers/api";
+import {
+  ackCleanMessage,
+  ackGetMessage,
+  ackMessage,
+  ackOperation,
+  ackPostParams,
+  apiClient,
+  appTransport,
+  b64,
+  futureExpiresAt,
+  generateKeypair,
+  invoiceIdOf,
+  newTransfer,
+  nowSecs,
+  randomId,
+  sha256hex,
+  sign,
+  sleep,
+  startApiApp,
+} from "./helpers";
 
 const jsonrpcVersion = "2.0";
 const okStatus = 200;
@@ -23,95 +41,38 @@ const senderEndpoint = "rpc://sender.example.com/json-rpc";
 // Setup
 // ---------------------------------------------------------------------------
 
-const tempDir = fs.mkdtempSync(path.join(__dirname, "temp-"));
-const appData = path.join(tempDir, "app-data");
-process.env.APP_DATA = appData;
-process.env.MAX_UPLOAD_BYTES = String(1024 * 1024);
 const retentionGraceSecs = 3600;
-process.env.RETENTION_GRACE_SECS = String(retentionGraceSecs);
 const maxQuota = 5;
-process.env.MAX_QUOTA = String(maxQuota);
 const maxTransfers = 5;
-process.env.MAX_TRANSFERS = String(maxTransfers);
-// The proof of work stays disabled in this suite (difficulty 0) as the
-// thresholds are never reached, see pow-http.spec.ts for the proof of work
-process.env.POW_RATE_THRESHOLD = "1000000";
-process.env.POW_GLOBAL_THRESHOLD = "1000000";
-
-loadApiEndpoints(app);
-
-afterAll(() => {
-  closeApiEndpoints();
-  return fs.promises.rm(tempDir, { recursive: true, force: true });
+const { tempDir, appData } = startApiApp("temp-", {
+  MAX_UPLOAD_BYTES: String(1024 * 1024),
+  RETENTION_GRACE_SECS: String(retentionGraceSecs),
+  MAX_QUOTA: String(maxQuota),
+  MAX_TRANSFERS: String(maxTransfers),
+  // The proof of work stays disabled in this suite (difficulty 0) as the
+  // thresholds are never reached, see pow-http.spec.ts for the proof of work
+  POW_RATE_THRESHOLD: "1000000",
+  POW_GLOBAL_THRESHOLD: "1000000",
 });
 
+const {
+  rpc,
+  upload,
+  uploadJson,
+  prepareInvoice,
+  postConsignment,
+  postMedia,
+  transferList,
+  transferAction,
+  invoiceStatus,
+  ackPrepare,
+  ackGet,
+  ackClean,
+} = apiClient(appTransport(app));
+
 // ---------------------------------------------------------------------------
-// Crypto helpers
+// Helpers depending on the data dir
 // ---------------------------------------------------------------------------
-
-const SPKI_PREFIX = Buffer.from("302a300506032b6570032100", "hex");
-
-interface Keypair {
-  privateKey: crypto.KeyObject;
-  pubkeyHex: string;
-}
-
-function generateKeypair(): Keypair {
-  const { privateKey, publicKey } = crypto.generateKeyPairSync("ed25519");
-  const spkiDer = publicKey.export({ type: "spki", format: "der" }) as Buffer;
-  const pubkeyHex = spkiDer.slice(SPKI_PREFIX.length).toString("hex");
-  return { privateKey, pubkeyHex };
-}
-
-function sign(privateKey: crypto.KeyObject, message: Buffer): string {
-  return crypto.sign(null, message, privateKey).toString("hex");
-}
-
-function b64(data: string | Buffer): string {
-  return Buffer.from(data).toString("base64");
-}
-
-function sha256hex(data: string | Buffer): string {
-  return crypto.createHash("sha256").update(data).digest("hex");
-}
-
-function randomId(): string {
-  return crypto.randomBytes(32).toString("hex");
-}
-
-function invoiceIdOf(beneficiary: string, invoicePk: string): string {
-  return sha256hex("rgb-proxy-server/invoice/v1" + beneficiary + invoicePk);
-}
-
-function ackMessage(
-  transferId: string,
-  ack: boolean,
-  consignmentHash: string,
-): Buffer {
-  return hashUtf8Message(
-    transferId + (ack ? "true" : "false") + consignmentHash,
-  );
-}
-
-function ackCleanMessage(transferIds: string[]): Buffer {
-  return hashUtf8Message([...transferIds].sort().join(""));
-}
-
-function ackGetMessage(transferIds: string[], timestamp: string): Buffer {
-  return hashUtf8Message([...transferIds].sort().join("") + timestamp);
-}
-
-function nowSecs(): number {
-  return Math.floor(Date.now() / 1000);
-}
-
-function futureExpiresAt(offsetSecs = 3600): string {
-  return String(nowSecs() + offsetSecs);
-}
-
-function sleep(ms: number) {
-  return new Promise((r) => setTimeout(r, ms));
-}
 
 let fileCounter = 0;
 
@@ -125,252 +86,18 @@ function storedFiles(dir: "consignments" | "media"): string[] {
   return fs.readdirSync(path.join(appData, dir));
 }
 
-// ---------------------------------------------------------------------------
-// RPC helpers
-// ---------------------------------------------------------------------------
-
-async function rpc(method: string, params: object) {
-  return request(app)
-    .post("/json-rpc")
-    .send({ jsonrpc: jsonrpcVersion, id: "1", method, params })
-    .expect(okStatus);
-}
-
-async function rpcUpload(
+// Uploads the content of a file written with writeTempFile
+function rpcUpload(
   method: string,
   params: Record<string, string>,
   filePath: string,
 ) {
-  let req = request(app)
-    .post("/json-rpc")
-    .set("Content-type", contentTypeForm)
-    .field("jsonrpc", jsonrpcVersion)
-    .field("id", "1")
-    .field("method", method);
-  for (const [k, v] of Object.entries(params)) {
-    req = req.field(`params[${k}]`, v);
-  }
-  return req.attach("file", fs.createReadStream(filePath)).expect(okStatus);
+  return upload(method, params, fs.readFileSync(filePath));
 }
 
 // Params sent as a single JSON-encoded field, as rgb-lib does
-async function rpcUploadJson(method: string, params: object, filePath: string) {
-  return request(app)
-    .post("/json-rpc")
-    .set("Content-type", contentTypeForm)
-    .field("jsonrpc", jsonrpcVersion)
-    .field("id", "1")
-    .field("method", method)
-    .field("params", JSON.stringify(params))
-    .attach("file", fs.createReadStream(filePath))
-    .expect(okStatus);
-}
-
-interface Invoice {
-  invoiceId: string;
-  recipient: Keypair;
-  expiresAt: string;
-}
-
-async function prepareInvoice(
-  quota?: string,
-  expiresInSecs = 3600,
-): Promise<Invoice> {
-  const recipient = generateKeypair();
-  const invoiceId = invoiceIdOf(randomId(), recipient.pubkeyHex);
-  const expiresAt = futureExpiresAt(expiresInSecs);
-  const params: Record<string, string> = {
-    invoice_id: invoiceId,
-    expires_at: expiresAt,
-    recipient_pk: recipient.pubkeyHex,
-  };
-  if (quota !== undefined) params.quota = quota;
-  const res = await rpc("invoice.prepare", params);
-  expect(res.body.result).toBe(true);
-  return { invoiceId, recipient, expiresAt };
-}
-
-interface Transfer {
-  invoiceId: string;
-  transferId: string;
-  sender: Keypair;
-}
-
-function newTransfer(invoiceId: string): Transfer {
-  const sender = generateKeypair();
-  return {
-    invoiceId,
-    transferId: deriveTransferId(invoiceId, sender.pubkeyHex),
-    sender,
-  };
-}
-
-// Posts a consignment with the given content, signing the request with the
-// sender key unless a signature is among the overrides
-async function postConsignment(
-  t: Transfer,
-  content: string,
-  overrides: Record<string, string> = {},
-) {
-  const filePath = writeTempFile(content);
-  const params: Record<string, string> = {
-    invoice_id: t.invoiceId,
-    transfer_id: t.transferId,
-    sender_transport_endpoint: senderEndpoint,
-    sender_pk: t.sender.pubkeyHex,
-    consignment_hash: sha256hex("plaintext " + content),
-    batch: "false",
-    file_size: String(Buffer.byteLength(content)),
-    pow_timestamp: String(nowSecs()),
-    pow_nonce: "0",
-    ...overrides,
-  };
-  if (!("signature" in overrides)) {
-    params.signature = sign(
-      t.sender.privateKey,
-      hashUtf8Message(
-        params.transfer_id + params.consignment_hash + sha256hex(content),
-      ),
-    );
-  }
-  return rpcUpload("consignment.post", params, filePath);
-}
-
-async function postMedia(
-  t: Transfer,
-  mediaId: string,
-  content: string,
-  signer: Keypair = t.sender,
-) {
-  const filePath = writeTempFile(content);
-  return rpcUpload(
-    "media.post",
-    {
-      transfer_id: t.transferId,
-      media_id: mediaId,
-      file_size: String(Buffer.byteLength(content)),
-      signature: sign(
-        signer.privateKey,
-        hashUtf8Message(t.transferId + mediaId + sha256hex(content)),
-      ),
-    },
-    filePath,
-  );
-}
-
-async function transferList(invoice: Invoice, signer = invoice.recipient) {
-  const timestamp = String(nowSecs());
-  return rpc("transfer.list", {
-    invoice_id: invoice.invoiceId,
-    timestamp,
-    signature: sign(
-      signer.privateKey,
-      hashUtf8Message(invoice.invoiceId + timestamp),
-    ),
-  });
-}
-
-async function transferAction(
-  action: "retrieved" | "delete",
-  transferId: string,
-  signer: Keypair,
-  signedAction: string = action,
-) {
-  return rpc(`transfer.${action}`, {
-    transfer_id: transferId,
-    signature: sign(
-      signer.privateKey,
-      hashUtf8Message(transferId + signedAction),
-    ),
-  });
-}
-
-async function invoiceStatus(invoiceId: string) {
-  const res = await rpc("invoice.check", { invoice_ids: [invoiceId] });
-  return res.body.result[invoiceId].status;
-}
-
-interface AckTransfer {
-  transferId: string;
-  recipient: Keypair;
-  consignmentHash: string;
-  signedTx: string;
-}
-
-interface AckOperation {
-  sender: Keypair;
-  transfers: AckTransfer[];
-  signedTxHash: string;
-  expiresAt: string;
-  params: Record<string, unknown>;
-}
-
-function ackOperation(count = 1, expiresInSecs = 3600): AckOperation {
-  const sender = generateKeypair();
-  const transfers = Array.from({ length: count }, (_, i) => ({
-    transferId: randomId(),
-    recipient: generateKeypair(),
-    consignmentHash: sha256hex(randomId()),
-    signedTx: b64(`encrypted signed tx ${i} ${randomId()}`),
-  }));
-  const signedTxHash = sha256hex(randomId());
-  const expiresAt = futureExpiresAt(expiresInSecs);
-  const transferData: Record<string, object> = {};
-  for (const t of transfers) {
-    transferData[t.transferId] = {
-      recipient_pk: t.recipient.pubkeyHex,
-      consignment_hash: t.consignmentHash,
-      signed_tx: t.signedTx,
-    };
-  }
-  return {
-    sender,
-    transfers,
-    signedTxHash,
-    expiresAt,
-    params: {
-      transfer_data: transferData,
-      expires_at: expiresAt,
-      signed_tx_hash: signedTxHash,
-      sender_pk: sender.pubkeyHex,
-    },
-  };
-}
-
-async function ackPrepare(count = 1, expiresInSecs = 3600) {
-  const op = ackOperation(count, expiresInSecs);
-  const res = await rpc("ack.prepare", op.params);
-  expect(res.body.result).toBe(true);
-  return op;
-}
-
-function ackPostParams(t: AckTransfer, ack: boolean) {
-  return {
-    transfer_id: t.transferId,
-    ack,
-    signature: sign(
-      t.recipient.privateKey,
-      ackMessage(t.transferId, ack, t.consignmentHash),
-    ),
-  };
-}
-
-async function ackGet(op: AckOperation, transferIds?: string[]) {
-  const ids = transferIds ?? op.transfers.map((t) => t.transferId);
-  const timestamp = String(nowSecs());
-  return rpc("ack.get", {
-    transfer_ids: ids,
-    timestamp,
-    signature: sign(op.sender.privateKey, ackGetMessage(ids, timestamp)),
-  });
-}
-
-async function ackClean(op: AckOperation) {
-  const ids = op.transfers.map((t) => t.transferId);
-  return rpc("ack.clean", {
-    transfer_ids: ids,
-    signature: sign(op.sender.privateKey, ackCleanMessage(ids)),
-  });
+function rpcUploadJson(method: string, params: object, filePath: string) {
+  return uploadJson(method, params, fs.readFileSync(filePath));
 }
 
 // ---------------------------------------------------------------------------

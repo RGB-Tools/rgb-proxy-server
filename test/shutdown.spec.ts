@@ -10,6 +10,7 @@ import {
   httpTransport,
   newTransfer,
   sleep,
+  useTempDir,
   waitFor,
 } from "./helpers";
 
@@ -26,12 +27,11 @@ const draining = -115;
 const exitMs = 2000;
 const drainExitMs = 7000;
 
-const tempDir = fs.mkdtempSync(path.join(__dirname, "temp-shutdown-"));
+const tempDir = useTempDir("temp-shutdown-");
 const servers: RunningServer[] = [];
 
-afterAll(async () => {
+afterAll(() => {
   for (const s of servers) s.kill();
-  await fs.promises.rm(tempDir, { recursive: true, force: true });
 });
 
 interface Exit {
@@ -140,7 +140,7 @@ async function postPendingTransfer(server: RunningServer) {
   const invoice = await server.client.prepareInvoice();
   const transfer = newTransfer(invoice.invoiceId);
   expect(
-    (await server.client.postConsignment(transfer, "pending")).result,
+    (await server.client.postConsignment(transfer, "pending")).body.result,
   ).toBe(true);
   return { invoice, transfer };
 }
@@ -185,7 +185,7 @@ describe("SIGUSR2 (drain mode)", () => {
     server.signal("SIGUSR2");
     expect(await server.waitForOutput("already draining")).toBe(true);
     const refused = await client.rpc("ack.prepare", ackOperation().params);
-    expect(refused.error.code).toBe(draining);
+    expect(refused.body.error.code).toBe(draining);
 
     // The recipient acts on the transfer and on the operation...
     await client.transferAction(
@@ -198,7 +198,7 @@ describe("SIGUSR2 (drain mode)", () => {
     // ...but the server only exits once the sender has retrieved the responses
     await sleep(6000); // longer than the drain check interval
     expect(server.exit()).toBeUndefined();
-    expect((await client.ackGet(op)).result.acks).toBeDefined();
+    expect((await client.ackGet(op)).body.result.acks).toBeDefined();
 
     expect(await server.waitForExit(drainExitMs)).toBe(true);
     expect(server.exit()).toEqual({ code: 0, signal: null });

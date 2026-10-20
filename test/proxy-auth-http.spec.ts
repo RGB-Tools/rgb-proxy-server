@@ -1,83 +1,29 @@
-import crypto from "crypto";
 import express from "express";
-import fs from "fs";
-import path from "path";
-import request from "supertest";
 
 import app from "../src/app";
+import { hashUtf8Message, loadApiEndpoints } from "../src/controllers/api";
 import {
-  closeApiEndpoints,
-  hashUtf8Message,
-  loadApiEndpoints,
-} from "../src/controllers/api";
-
-const jsonrpcVersion = "2.0";
-const okStatus = 200;
-
-// ---------------------------------------------------------------------------
-// Helpers
-//
-// Mirror api.spec.ts, duplicated to keep this file's PROXY_AUTH_PUBKEYS setup
-// fully independent of the shared suite. Defined before the setup below,
-// since generateKeypair() is called immediately.
-// ---------------------------------------------------------------------------
-
-const SPKI_PREFIX = Buffer.from("302a300506032b6570032100", "hex");
-
-function generateKeypair() {
-  const { privateKey, publicKey } = crypto.generateKeyPairSync("ed25519");
-  const spkiDer = publicKey.export({ type: "spki", format: "der" }) as Buffer;
-  const pubkeyHex = spkiDer.slice(SPKI_PREFIX.length).toString("hex");
-  return { privateKey, pubkeyHex };
-}
-
-function sign(privateKey: crypto.KeyObject, message: Buffer): string {
-  return crypto.sign(null, message, privateKey).toString("hex");
-}
-
-function b64(data: string | Buffer): string {
-  return Buffer.from(data).toString("base64");
-}
-
-function sha256hex(data: string): string {
-  return crypto.createHash("sha256").update(data).digest("hex");
-}
-
-function randomId(): string {
-  return crypto.randomBytes(32).toString("hex");
-}
-
-function futureExpiresAt(offsetSecs = 3600): string {
-  return String(Math.floor(Date.now() / 1000) + offsetSecs);
-}
-
-async function rpc(method: string, params: object) {
-  return request(app)
-    .post("/json-rpc")
-    .send({ jsonrpc: jsonrpcVersion, id: "1", method, params })
-    .expect(okStatus);
-}
-
-// ---------------------------------------------------------------------------
-// Setup
-// ---------------------------------------------------------------------------
-
-const tempDir = fs.mkdtempSync(path.join(__dirname, "temp-proxy-auth-"));
-process.env.APP_DATA = path.join(tempDir, "app-data");
+  apiClient,
+  appTransport,
+  b64,
+  futureExpiresAt,
+  generateKeypair,
+  randomId,
+  sha256hex,
+  sign,
+  startApiApp,
+} from "./helpers";
 
 // PROXY_AUTH_PUBKEYS is read once, inside loadApiEndpoints, into a module-level
-// variable - it must be set before that call. Jest gives this file its own isolated
-// module registry, so this doesn't affect test/api.spec.ts's separate instance.
+// variable - it must be set before that call. Jest gives this file its own
+// isolated module registry, so this doesn't affect the other suites.
 const allowed = generateKeypair();
 const otherAllowed = generateKeypair();
-process.env.PROXY_AUTH_PUBKEYS = `${allowed.pubkeyHex}, ${otherAllowed.pubkeyHex}`;
-
-loadApiEndpoints(app);
-
-afterAll(() => {
-  closeApiEndpoints();
-  return fs.promises.rm(tempDir, { recursive: true, force: true });
+startApiApp("temp-proxy-auth-", {
+  PROXY_AUTH_PUBKEYS: `${allowed.pubkeyHex}, ${otherAllowed.pubkeyHex}`,
 });
+
+const { rpc } = apiClient(appTransport(app));
 
 function invoicePrepareParams(quota?: string) {
   const recipient = generateKeypair();

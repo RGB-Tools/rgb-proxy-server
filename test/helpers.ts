@@ -1,9 +1,16 @@
 import crypto from "crypto";
+import type { Application } from "express";
+import fs from "fs";
+import path from "path";
 import request from "supertest";
 
-import type { Application } from "express";
-
-import { deriveTransferId, hashUtf8Message } from "../src/controllers/api";
+import app from "../src/app";
+import {
+  closeApiEndpoints,
+  deriveTransferId,
+  hashUtf8Message,
+  loadApiEndpoints,
+} from "../src/controllers/api";
 
 // Helpers shared by the suites exercising the server as a client would,
 // either in-process (supertest) or as a running server (fetch), see Transport
@@ -30,6 +37,10 @@ export function sign(privateKey: crypto.KeyObject, message: Buffer): string {
   return crypto.sign(null, message, privateKey).toString("hex");
 }
 
+export function b64(data: string | Buffer): string {
+  return Buffer.from(data).toString("base64");
+}
+
 export function sha256hex(data: string | Buffer): string {
   return crypto.createHash("sha256").update(data).digest("hex");
 }
@@ -40,6 +51,27 @@ export function randomId(): string {
 
 export function invoiceIdOf(beneficiary: string, invoicePk: string): string {
   return sha256hex("rgb-proxy-server/invoice/v1" + beneficiary + invoicePk);
+}
+
+export function ackMessage(
+  transferId: string,
+  ack: boolean,
+  consignmentHash: string,
+): Buffer {
+  return hashUtf8Message(
+    transferId + (ack ? "true" : "false") + consignmentHash,
+  );
+}
+
+export function ackCleanMessage(transferIds: string[]): Buffer {
+  return hashUtf8Message([...transferIds].sort().join(""));
+}
+
+export function ackGetMessage(
+  transferIds: string[],
+  timestamp: string,
+): Buffer {
+  return hashUtf8Message([...transferIds].sort().join("") + timestamp);
 }
 
 export function nowSecs(): number {
@@ -65,74 +97,127 @@ export async function waitFor(
 }
 
 // ---------------------------------------------------------------------------
+// Suite setup
+// ---------------------------------------------------------------------------
+
+// Creates a temp dir next to the tests, removed once the suite is done
+export function useTempDir(prefix: string): string {
+  const tempDir = fs.mkdtempSync(path.join(__dirname, prefix));
+  afterAll(() => fs.promises.rm(tempDir, { recursive: true, force: true }));
+  return tempDir;
+}
+
+// Loads the API endpoints on the app with its own data dir, closing them once
+// the suite is done. The environment is set first, as the configuration is
+// read when loading. Jest gives every suite its own module registry, so suites
+// don't share the API state
+export function startApiApp(prefix: string, env: Record<string, string> = {}) {
+  const tempDir = fs.mkdtempSync(path.join(__dirname, prefix));
+  const appData = path.join(tempDir, "app-data");
+  process.env.APP_DATA = appData;
+  Object.assign(process.env, env);
+  loadApiEndpoints(app);
+  afterAll(() => {
+    closeApiEndpoints();
+    return fs.promises.rm(tempDir, { recursive: true, force: true });
+  });
+  return { app, tempDir, appData };
+}
+
+// ---------------------------------------------------------------------------
 // Transports
 // ---------------------------------------------------------------------------
 
-// Both methods resolve to the JSON-RPC response body. Params of uploads are
-// sent as `params[<name>]` form fields, next to the `file`
+// Methods resolve to an object whose `body` is the JSON-RPC response. Params
+// of uploads are sent as `params[<name>]` form fields next to the `file`, or,
+// for uploadJson, as a single JSON-encoded `params` field as rgb-lib does
+// Same shape as the supertest responses, whose body is untyped as well
+export interface RpcResponse {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  body: any;
+}
+
 export interface Transport {
-  rpc(method: string, params: object): Promise<any>;
+  rpc(method: string, params: object): Promise<RpcResponse>;
   upload(
     method: string,
     params: Record<string, string>,
     content: string | Buffer,
-  ): Promise<any>;
+  ): Promise<RpcResponse>;
+  uploadJson(
+    method: string,
+    params: object,
+    content: string | Buffer,
+  ): Promise<RpcResponse>;
 }
 
 // Talks to the Express app directly, without listening on a port
 export function appTransport(app: Application): Transport {
+  const uploadRequest = (method: string) =>
+    request(app)
+      .post("/json-rpc")
+      .set("Content-type", "multipart/form-data")
+      .field("jsonrpc", "2.0")
+      .field("id", "1")
+      .field("method", method);
   return {
-    async rpc(method, params) {
-      const res = await request(app)
+    rpc: (method, params) =>
+      request(app)
         .post("/json-rpc")
         .send({ jsonrpc: "2.0", id: "1", method, params })
-        .expect(200);
-      return res.body;
-    },
-    async upload(method, params, content) {
-      let req = request(app)
-        .post("/json-rpc")
-        .set("Content-type", "multipart/form-data")
-        .field("jsonrpc", "2.0")
-        .field("id", "1")
-        .field("method", method);
+        .expect(200),
+    upload(method, params, content) {
+      let req = uploadRequest(method);
       for (const [k, v] of Object.entries(params)) {
         req = req.field(`params[${k}]`, v);
       }
-      const res = await req
-        .attach("file", Buffer.from(content), "file")
-        .expect(200);
-      return res.body;
+      return req.attach("file", Buffer.from(content), "file").expect(200);
     },
+    uploadJson: (method, params, content) =>
+      uploadRequest(method)
+        .field("params", JSON.stringify(params))
+        .attach("file", Buffer.from(content), "file")
+        .expect(200),
   };
 }
 
 // Talks to a running server
 export function httpTransport(baseUrl: string): Transport {
-  const url = `${baseUrl}/json-rpc`;
+  const post = async (init: { headers?: HeadersInit; body: BodyInit }) => {
+    const res = await fetch(`${baseUrl}/json-rpc`, { method: "POST", ...init });
+    return { body: await res.json() };
+  };
+  const uploadForm = (
+    method: string,
+    content: string | Buffer,
+    fields: Record<string, string>,
+  ) => {
+    const form = new FormData();
+    form.append("jsonrpc", "2.0");
+    form.append("id", "1");
+    form.append("method", method);
+    for (const [k, v] of Object.entries(fields)) form.append(k, v);
+    const bytes =
+      typeof content === "string" ? content : new Uint8Array(content);
+    form.append("file", new Blob([bytes]), "file");
+    return post({ body: form });
+  };
   return {
-    async rpc(method, params) {
-      const res = await fetch(url, {
-        method: "POST",
+    rpc: (method, params) =>
+      post({
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ jsonrpc: "2.0", id: "1", method, params }),
-      });
-      return res.json();
-    },
-    async upload(method, params, content) {
-      const form = new FormData();
-      form.append("jsonrpc", "2.0");
-      form.append("id", "1");
-      form.append("method", method);
-      for (const [k, v] of Object.entries(params)) {
-        form.append(`params[${k}]`, v);
-      }
-      const bytes =
-        typeof content === "string" ? content : new Uint8Array(content);
-      form.append("file", new Blob([bytes]), "file");
-      const res = await fetch(url, { method: "POST", body: form });
-      return res.json();
-    },
+      }),
+    upload: (method, params, content) =>
+      uploadForm(
+        method,
+        content,
+        Object.fromEntries(
+          Object.entries(params).map(([k, v]) => [`params[${k}]`, v]),
+        ),
+      ),
+    uploadJson: (method, params, content) =>
+      uploadForm(method, content, { params: JSON.stringify(params) }),
   };
 }
 
@@ -182,9 +267,7 @@ export function ackOperation(count = 1, expiresInSecs = 3600): AckOperation {
     transferId: randomId(),
     recipient: generateKeypair(),
     consignmentHash: sha256hex(randomId()),
-    signedTx: Buffer.from(`encrypted signed tx ${i} ${randomId()}`).toString(
-      "base64",
-    ),
+    signedTx: b64(`encrypted signed tx ${i} ${randomId()}`),
   }));
   const signedTxHash = sha256hex(randomId());
   const expiresAt = futureExpiresAt(expiresInSecs);
@@ -216,17 +299,15 @@ export function ackPostParams(t: AckTransfer, ack: boolean) {
     ack,
     signature: sign(
       t.recipient.privateKey,
-      hashUtf8Message(
-        t.transferId + (ack ? "true" : "false") + t.consignmentHash,
-      ),
+      ackMessage(t.transferId, ack, t.consignmentHash),
     ),
   };
 }
 
 // The API calls the suites need, on top of a transport. They return the
-// JSON-RPC response bodies, expecting success only where a helper says so
+// transport's responses, expecting success only where a helper says so
 export function apiClient(transport: Transport) {
-  const { rpc, upload } = transport;
+  const { rpc, upload, uploadJson } = transport;
 
   async function prepareInvoice(
     quota?: string,
@@ -242,35 +323,46 @@ export function apiClient(transport: Transport) {
     };
     if (quota !== undefined) params.quota = quota;
     const res = await rpc("invoice.prepare", params);
-    expect(res.result).toBe(true);
+    expect(res.body.result).toBe(true);
     return { invoiceId, recipient, expiresAt };
   }
 
-  // Posts a consignment with the given content, signed by the sender
-  async function postConsignment(t: Transfer, content: string) {
-    const consignmentHash = sha256hex("plaintext " + content);
-    return upload(
-      "consignment.post",
-      {
-        invoice_id: t.invoiceId,
-        transfer_id: t.transferId,
-        sender_transport_endpoint: "rpc://sender.example.com/json-rpc",
-        sender_pk: t.sender.pubkeyHex,
-        consignment_hash: consignmentHash,
-        batch: "false",
-        file_size: String(Buffer.byteLength(content)),
-        pow_timestamp: String(nowSecs()),
-        pow_nonce: "0",
-        signature: sign(
-          t.sender.privateKey,
-          hashUtf8Message(t.transferId + consignmentHash + sha256hex(content)),
+  // Posts a consignment with the given content, signing the request with the
+  // sender key unless a signature is among the overrides
+  async function postConsignment(
+    t: Transfer,
+    content: string,
+    overrides: Record<string, string> = {},
+  ) {
+    const params: Record<string, string> = {
+      invoice_id: t.invoiceId,
+      transfer_id: t.transferId,
+      sender_transport_endpoint: "rpc://sender.example.com/json-rpc",
+      sender_pk: t.sender.pubkeyHex,
+      consignment_hash: sha256hex("plaintext " + content),
+      batch: "false",
+      file_size: String(Buffer.byteLength(content)),
+      pow_timestamp: String(nowSecs()),
+      pow_nonce: "0",
+      ...overrides,
+    };
+    if (!("signature" in overrides)) {
+      params.signature = sign(
+        t.sender.privateKey,
+        hashUtf8Message(
+          params.transfer_id + params.consignment_hash + sha256hex(content),
         ),
-      },
-      content,
-    );
+      );
+    }
+    return upload("consignment.post", params, content);
   }
 
-  async function postMedia(t: Transfer, mediaId: string, content: string) {
+  async function postMedia(
+    t: Transfer,
+    mediaId: string,
+    content: string,
+    signer: Keypair = t.sender,
+  ) {
     return upload(
       "media.post",
       {
@@ -278,7 +370,7 @@ export function apiClient(transport: Transport) {
         media_id: mediaId,
         file_size: String(Buffer.byteLength(content)),
         signature: sign(
-          t.sender.privateKey,
+          signer.privateKey,
           hashUtf8Message(t.transferId + mediaId + sha256hex(content)),
         ),
       },
@@ -286,13 +378,16 @@ export function apiClient(transport: Transport) {
     );
   }
 
-  async function transferList(invoice: Invoice) {
+  async function transferList(
+    invoice: Invoice,
+    signer: Keypair = invoice.recipient,
+  ) {
     const timestamp = String(nowSecs());
     return rpc("transfer.list", {
       invoice_id: invoice.invoiceId,
       timestamp,
       signature: sign(
-        invoice.recipient.privateKey,
+        signer.privateKey,
         hashUtf8Message(invoice.invoiceId + timestamp),
       ),
     });
@@ -302,22 +397,26 @@ export function apiClient(transport: Transport) {
     action: "retrieved" | "delete",
     transferId: string,
     signer: Keypair,
+    signedAction: string = action,
   ) {
     return rpc(`transfer.${action}`, {
       transfer_id: transferId,
-      signature: sign(signer.privateKey, hashUtf8Message(transferId + action)),
+      signature: sign(
+        signer.privateKey,
+        hashUtf8Message(transferId + signedAction),
+      ),
     });
   }
 
   async function invoiceStatus(invoiceId: string) {
     const res = await rpc("invoice.check", { invoice_ids: [invoiceId] });
-    return res.result[invoiceId].status;
+    return res.body.result[invoiceId].status;
   }
 
   async function ackPrepare(count = 1, expiresInSecs = 3600) {
     const op = ackOperation(count, expiresInSecs);
     const res = await rpc("ack.prepare", op.params);
-    expect(res.result).toBe(true);
+    expect(res.body.result).toBe(true);
     return op;
   }
 
@@ -331,16 +430,22 @@ export function apiClient(transport: Transport) {
     return rpc("ack.get", {
       transfer_ids: ids,
       timestamp,
-      signature: sign(
-        op.sender.privateKey,
-        hashUtf8Message([...ids].sort().join("") + timestamp),
-      ),
+      signature: sign(op.sender.privateKey, ackGetMessage(ids, timestamp)),
+    });
+  }
+
+  async function ackClean(op: AckOperation) {
+    const ids = op.transfers.map((t) => t.transferId);
+    return rpc("ack.clean", {
+      transfer_ids: ids,
+      signature: sign(op.sender.privateKey, ackCleanMessage(ids)),
     });
   }
 
   return {
     rpc,
     upload,
+    uploadJson,
     prepareInvoice,
     postConsignment,
     postMedia,
@@ -350,5 +455,6 @@ export function apiClient(transport: Transport) {
     ackPrepare,
     ackPost,
     ackGet,
+    ackClean,
   };
 }
